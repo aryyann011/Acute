@@ -1,6 +1,7 @@
 import typer
 import sys
 from loguru import logger
+from agent.rag.scanner import RepositoryScanner
 
 app = typer.Typer()
 
@@ -22,6 +23,8 @@ def index(path: str = "."):
     """
     Index the codebase into the local vector database.
     """
+    scanner = RepositoryScanner(path)
+    valid_files = scanner.get_tracked_files()
     logger.info(f"Starting ingestion process for directory: {path}")
     logger.debug(f"DEBUG: Initializing file scanner at absolute path for {path}")
 
