@@ -3,6 +3,7 @@ import sys
 from loguru import logger
 from agent.rag.scanner import RepositoryScanner
 from agent.rag.ingest import CodeChunker
+from agent.rag.embedder import VectorEmbedder
 
 app = typer.Typer()
 
@@ -32,19 +33,23 @@ def index(path: str = "."):
     
     if not valid_files:
         logger.warning("No files found to process. Aborting.")
+    chunker = CodeChunker()
+    chunks = chunker.process_files(valid_files)
+    
+    if not chunks:
+        logger.warning("No chunks generated. Aborting.")
         raise typer.Exit(code=1)
+
+    embedder = VectorEmbedder()
+    embedded_chunks = embedder.process_chunks(chunks)
     
-    chunker = CodeChunker(valid_files)
-    chunks = chunker.process_files()
-    
-    if chunks:
-        logger.success("Printing a sample chunk to verify context enrichment:")
+    if embedded_chunks:
+        logger.success("Printing a sample embedded chunk:")
         print("\n" + "="*60)
-        print(f"File: {chunks[0]['filepath']}")
-        print(f"Function/Class Name: {chunks[0]['name']}")
-        print(f"Lines: {chunks[0]['start_line']} to {chunks[0]['end_line']}")
-        print("--- Enriched Content ---")
-        print(chunks[0]['content'])
+        print(f"File: {embedded_chunks[0]['filepath']}")
+        print(f"Function/Class Name: {embedded_chunks[0]['name']}")
+        print(f"Vector Dimension (Size): {len(embedded_chunks[0]['vector'])}")
+        print(f"Vector Sample (first 5 floats): {embedded_chunks[0]['vector'][:5]}")
         print("="*60 + "\n")
 
 @app.command()
