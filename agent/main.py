@@ -4,6 +4,7 @@ from loguru import logger
 from agent.rag.scanner import RepositoryScanner
 from agent.rag.ingest import CodeChunker
 from agent.rag.embedder import VectorEmbedder
+from agent.rag.vector_store import QdrantDB
 
 app = typer.Typer()
 
@@ -51,6 +52,12 @@ def index(path: str = "."):
         print(f"Vector Dimension (Size): {len(embedded_chunks[0]['vector'])}")
         print(f"Vector Sample (first 5 floats): {embedded_chunks[0]['vector'][:5]}")
         print("="*60 + "\n")
+
+    logger.info("Connecting to local Qdrant Vector DB...")
+    db = QdrantDB()
+    db.insert_chunks(embedded_chunks)
+    
+    logger.success(f"Phase 2 Complete. {len(embedded_chunks)} chunks securely persisted to disk.")
 
 @app.command()
 def fix(bug: str):

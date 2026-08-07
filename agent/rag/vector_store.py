@@ -11,14 +11,14 @@ class QdrantDB:
         logger.debug("Initialising local Qdratn database connection...")
         self.client = QdrantClient(path=".agent_db")
 
-    def _recreate_collection(self):
+    def recreate_collection(self):
         """The Nuke&Rebuild phase.
         Drops the collection if it exists and creates a fresh one.
         """
 
         self.client.recreate_collection(
-            collection_name=self.collection_name
-            vectors_config=models.VecotorParams(
+            collection_name=self.collection_name,
+            vectors_config=models.VectorParams(
                 size=384,
                 distance=models.Distance.COSINE
             )
@@ -68,7 +68,7 @@ class QdrantDB:
         )
 
         results = []
-        for hit in search_result:
+        for hit in search_results:
             results.append(hit.payload)
 
         return results
