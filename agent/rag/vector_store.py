@@ -50,13 +50,13 @@ class QdrantDB:
 
             points.append(point)
 
-            logger.info(f"uploading {len(points)} points to Qdrant...")
+        logger.info(f"uploading {len(points)} points to Qdrant...")
 
-            self.client.upsert(
-                collection_name=self.collection_name,
-                points=points
-            )
-            logger.success(f"Successfully indexed {len(points)} chunks into the database")
+        self.client.upsert(
+            collection_name=self.collection_name,
+            points=points
+        )
+        logger.success(f"Successfully indexed {len(points)} chunks into the database")
 
     def search(self, query_vector:List[float], limit: int=5) -> List[Dict[str, Any]]:
         """Takes vectorized bug report and returns the closest code chunks"""

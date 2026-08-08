@@ -26,19 +26,35 @@ class CodeChunker:
             return self.js_parser
         return None
 
+    def _is_js_arrow_function_assignment(self, node) -> bool:
+        """Helper to detect if a const/let is actually a function assignment."""
+        if node.type not in ["lexical_declaration", "variable_declaration"]:
+            return False
+        for child in node.children:
+            if child.type == "variable_declarator":
+                for subchild in child.children:
+                    if subchild.type == "arrow_function":
+                        return True
+        return False
+
     def _get_node_name(self, node, content_bytes: bytes) -> str:
         """Helper to find the identifier (name) of a function or class"""
-        # If it's a wrapper node, dive inside it to find the actual function/class
         if node.type in ["decorated_definition", "export_statement", "lexical_declaration", "variable_declaration"]:
             for child in node.children:
                 if child.type in ["function_definition", "class_definition", "function_declaration", "class_declaration", "arrow_function"]:
                     node = child # Reassign 'node' to the inner element and continue
                     break
 
-        # Now look for the identifier
         for child in node.children:
             if child.type == "identifier":
                 return content_bytes[child.start_byte:child.end_byte].decode('utf8')
+
+        if node.type in ["lexical declaration", "variable declaration"]:
+            for child in node.children:
+                if child.type == "variable_declarator":
+                    for subchild in child.children:
+                        if subchild.type == "identifier":
+                            return content_bytes[subchild.start_byte:subchild.end.byte].decode('utf8')
                 
         return "unknown"
 
@@ -60,6 +76,10 @@ class CodeChunker:
 
             globals_text = []
             for node in root_node.children:
+                if node.type in ["lexical declaration", "variable declaration"]:
+                    if self._is_js_arrow_function_assignment(node):
+                        continue
+                
                 if node.type in ["import_statement", "import_from_statement", "expression_statement", "lexical_declaration"]:
                     globals_text.append(node.text.decode('utf8'))
 
