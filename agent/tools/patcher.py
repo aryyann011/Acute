@@ -1,5 +1,6 @@
 import shutil
 from pathlib import Path
+import subprocess
 from loguru import logger
 from tree_sitter import Language, Parser, Query, QueryCursor
 import tree_sitter_python as tspy
@@ -26,8 +27,7 @@ class CodePatcher:
             logger.error(f"File not found: {path}")
             return False
 
-        self._backup_file(path)
-
+        backup_path = self._backup_file(path)
         with open(path, "rb") as f:
             file_bytes = f.read()
 
@@ -48,7 +48,7 @@ class CodePatcher:
 
         cursor = QueryCursor(query)
         captures = cursor.captures(tree.root_node)
-
+        
         target_nodes = captures.get("target_node", [])
 
         if not target_nodes:
@@ -76,4 +76,15 @@ class CodePatcher:
             f.write(patched_bytes)
             
         logger.success(f"Successfully patched '{target_function}' in {path}")
+
+        try:
+            logger.info("Launching VS Code diff viewer...")
+            import sys
+            
+            vscode_cmd = "code.cmd" if sys.platform == "win32" else "code"
+            
+            subprocess.run([vscode_cmd, "--diff", str(backup_path), str(path)], check=False)
+        except FileNotFoundError:
+            logger.warning("VS Code CLI ('code') not found. Skipping visual diff.")
+
         return True
