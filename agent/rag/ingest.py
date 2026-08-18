@@ -1,8 +1,8 @@
-from pathlib import Path
-from loguru import logger
 import tree_sitter_python as tspy
 import tree_sitter_javascript as tsjs
 from tree_sitter import Language, Parser
+from pathlib import Path
+from loguru import logger
 
 class CodeChunker:
     def __init__(self):
@@ -39,22 +39,27 @@ class CodeChunker:
 
     def _get_node_name(self, node, content_bytes: bytes) -> str:
         """Helper to find the identifier (name) of a function or class"""
-        if node.type in ["decorated_definition", "export_statement", "lexical_declaration", "variable_declaration"]:
+        
+        # 1. Peel the outer wrappers (decorators or exports) to get to the core definition
+        if node.type in ["decorated_definition", "export_statement"]:
             for child in node.children:
-                if child.type in ["function_definition", "class_definition", "function_declaration", "class_declaration", "arrow_function"]:
+                if child.type in ["function_definition", "class_definition", "function_declaration", "class_declaration", "lexical_declaration", "variable_declaration"]:
                     node = child # Reassign 'node' to the inner element and continue
                     break
 
+        # 2. Standard identifier check (for functions, classes, methods)
         for child in node.children:
             if child.type == "identifier":
                 return content_bytes[child.start_byte:child.end_byte].decode('utf8')
 
-        if node.type in ["lexical declaration", "variable declaration"]:
+        # 3. JS Arrow Function identifier extraction
+        if node.type in ["lexical_declaration", "variable_declaration"]:
             for child in node.children:
                 if child.type == "variable_declarator":
                     for subchild in child.children:
                         if subchild.type == "identifier":
-                            return content_bytes[subchild.start_byte:subchild.end.byte].decode('utf8')
+                            # Fixed typo: end_byte
+                            return content_bytes[subchild.start_byte:subchild.end_byte].decode('utf8')
                 
         return "unknown"
 
@@ -76,7 +81,7 @@ class CodeChunker:
 
             globals_text = []
             for node in root_node.children:
-                if node.type in ["lexical declaration", "variable declaration"]:
+                if node.type in ["lexical_declaration", "variable_declaration"]:
                     if self._is_js_arrow_function_assignment(node):
                         continue
                 
@@ -97,38 +102,69 @@ class CodeChunker:
 
         target_types = [
             "function_definition", 
-            "decorated_definition", 
             "function_declaration", 
             "method_definition", 
             "arrow_function"
         ]
-
+        
+        if node.type == "decorated_definition":
+            # Peek inside to see if it's wrapping a class
+            is_class = any(child.type in ["class_definition", "class_declaration"] for child in node.children)
+            if not is_class:
+                # It's just a decorated function, chunk it safely
+                self._save_chunk(node, path, content_bytes, file_header, class_context)
+                return
+            # If it IS a class, do nothing. It falls down to the class un-wrapper block below.
+            
         if node.type in target_types:
-            chunk_content = file_header
-            if class_context:
-                chunk_content += f"# Class Context: {class_context}\n"
-            chunk_content += content_bytes[node.start_byte:node.end_byte].decode('utf8')
-
-            chunk = {
-                "filepath": str(path),
-                "name": self._get_node_name(node, content_bytes),
-                "type": node.type,
-                "start_line": node.start_point.row + 1,
-                "end_line": node.end_point.row + 1,
-                "content": chunk_content
-            }
-            self.chunks.append(chunk)
+            self._save_chunk(node, path, content_bytes, file_header, class_context)
             return
 
+        # Target JS Arrow Functions wrapped in const/let
+        if self._is_js_arrow_function_assignment(node):
+            self._save_chunk(node, path, content_bytes, file_header, class_context)
+            return
+
+        # Explicitly catch class types AND decorated classes that fell through above
         class_types = ["class_definition", "class_declaration"]
-        if node.type in class_types:
+        if node.type in class_types or (node.type == "decorated_definition" and any(c.type in class_types for c in node.children)):
             class_name = self._get_node_name(node, content_bytes)
-            for child in node.children:
-                # 'block' for Python, 'class_body' for JS/TS
-                if child.type in ["block", "class_body"]:
-                    for method_node in child.children:
-                        self._extract_chunks(method_node, path, content_bytes, file_header, class_context=class_name)
+            
+            # We need to find the actual class body to extract methods
+            body_node = None
+            if node.type == "decorated_definition":
+                for child in node.children:
+                    if child.type in class_types:
+                        for subchild in child.children:
+                            if subchild.type in ["block", "class_body"]:
+                                body_node = subchild
+            else:
+                for child in node.children:
+                    if child.type in ["block", "class_body"]:
+                        body_node = child
+
+            if body_node:
+                for method_node in body_node.children:
+                    self._extract_chunks(method_node, path, content_bytes, file_header, class_context=class_name)
             return
 
+        # Keep recursing down the tree
         for child in node.children:
             self._extract_chunks(child, path, content_bytes, file_header, class_context)
+
+    def _save_chunk(self, node, path: Path, content_bytes: bytes, file_header: str, class_context: str):
+        """Helper to build and append the dictionary to keep code DRY."""
+        chunk_content = file_header
+        if class_context:
+            chunk_content += f"# Class Context: {class_context}\n"
+        chunk_content += content_bytes[node.start_byte:node.end_byte].decode('utf8')
+
+        chunk = {
+            "filepath": str(path),
+            "name": self._get_node_name(node, content_bytes),
+            "type": node.type,
+            "start_line": node.start_point.row + 1,
+            "end_line": node.end_point.row + 1,
+            "content": chunk_content
+        }
+        self.chunks.append(chunk)
