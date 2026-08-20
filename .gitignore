@@ -12,3 +12,4 @@ wheels/
 logs/
 .agent_db/
 pycache/
+.env
