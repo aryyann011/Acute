@@ -46,3 +46,11 @@ class VectorEmbedder:
 
         logger.success(f"Successfully embedded {len(processed_chunks)} chunks")
         return processed_chunks
+
+    def embed_text(self, text: str) -> List[float]:
+        """
+        Embeds a single raw string (like a bug report) into a 384-dim vector list
+        so it can be searched against Qdrant.
+        """
+        embeddings = list(self.embedding_model.embed([text]))
+        return embeddings[0].tolist()
