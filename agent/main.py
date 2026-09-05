@@ -64,6 +64,11 @@ def fix(bug: str):
     """
     Run the autonomous agent loop to fix a bug report.
     """
+    if str == "":
+        logger.error(f"nothing to fix the prompt is empty")
+        return 
+
+    
     logger.info(f"Initializing patch agent for bug: {bug}")
 
 if __name__ == "__main__":
