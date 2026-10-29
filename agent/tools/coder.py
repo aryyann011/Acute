@@ -13,6 +13,9 @@ class CodePatch(BaseModel):
     explanation: str = Field(description="The reasoning for this specific fix. Must be generated before the code.")
     fixed_code: str = Field(description="The raw, complete python or javascript code for the fixed function. Do NOT include markdown fences like ```python.")
 
+class MultiFilePatch(BaseModel):
+    edits: list[CodePatch] = Field(description="The list of edits to apply (one per changed function).")
+
 class Coder:
     def __init__(self):
         api_key = os.getenv("GEMINI_API_KEY")
@@ -22,8 +25,7 @@ class Coder:
         self.client = genai.Client(api_key=api_key)
         self.model = "gemini-2.5-flash" 
         
-    def generate_patch(self, bug_report: str, old_code: str) -> str | None:
-        def generate_patch(self, bug_report: str, xml_context: str) -> MultiFilePatch | None:
+    def generate_patch(self, bug_report: str, xml_context: str) -> MultiFilePatch | None:
         """
         Takes a bug report and a multi-file XML context document.
         Returns a MultiFilePatch containing a list of edits, or None if the API fails.
