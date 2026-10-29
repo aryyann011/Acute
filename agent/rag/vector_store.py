@@ -8,7 +8,7 @@ class QdrantDB:
     def __init__(self, collection_name: str = "codebase"):
         self.collection_name = collection_name
 
-        logger.debug("Initialising local Qdratn database connection...")
+        logger.debug("Initialising local Qdrant database connection...")
         self.client = QdrantClient(path=".agent_db")
 
     def recreate_collection(self):
@@ -26,7 +26,7 @@ class QdrantDB:
 
     def insert_chunks(self, chunks:List[Dict[str, Any]]):
         """
-        Takes the embedded chunks, formats them into Qdrant Points, and insets them
+        Takes the embedded chunks, formats them into Qdrant Points, and inserts them
         """
 
         if not chunks:
@@ -61,14 +61,12 @@ class QdrantDB:
     def search(self, query_vector:List[float], limit: int=5) -> List[Dict[str, Any]]:
         """Takes vectorized bug report and returns the closest code chunks"""
         logger.info(f"Searching database for top {limit} closest matches...")
-        search_results = self.client.search(
+        response = self.client.query_points(
             collection_name=self.collection_name,
-            query_vector=query_vector,
+            query=query_vector,
             limit=limit
         )
 
-        results = []
-        for hit in search_results:
-            results.append(hit.payload)
+        results = [point.payload for point in response.points]
 
         return results

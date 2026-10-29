@@ -8,7 +8,7 @@ class VectorEmbedder:
     def __init__(self):
         logger.info("Initialising Tokenizer and FastEmbed models (BAAI/bge-small-en-v1.5)...")
         self.tokenizer = Tokenizer.from_pretrained("BAAI/bge-small-en-v1.5")
-        self.embedder = TextEmbedding(mode_name="BAAI/bge-small-en-v1.5")
+        self.embedder = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
 
         self.max_tokens = 500
         self.overlap = 100
@@ -52,5 +52,5 @@ class VectorEmbedder:
         Embeds a single raw string (like a bug report) into a 384-dim vector list
         so it can be searched against Qdrant.
         """
-        embeddings = list(self.embedding_model.embed([text]))
+        embeddings = list(self.embedder.embed([text]))
         return embeddings[0].tolist()
