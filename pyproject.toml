@@ -5,6 +5,8 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "google-genai>=1.0.0",
+    "python-dotenv>=1.0.0",
     "fastembed>=0.8.0",
     "gitpython>=3.1.57",
     "qdrant-client>=1.19.0",

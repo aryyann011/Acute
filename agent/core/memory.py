@@ -1,11 +1,11 @@
-from typing import Dict, List
+from typing import Any, Dict, List
 from pydantic import BaseModel, Field, ValidationError
 from loguru import logger
 
 class CodeChunk(BaseModel):
     """
     strict validation schema for data coming out of Qdrant
-    Ensures no currupted data (missing keys or empty strings) poisons the LLM prompt.
+    Ensures no corrupted data (missing keys or empty strings) poisons the LLM prompt.
     """
     filepath: str = Field(min_length=1)
     name: str = Field(min_length=1)
@@ -15,12 +15,12 @@ class ContextManager:
     def assemble_xml_context(self, raw_chunks: List[Dict[str, Any]]) -> str:
         """
         Validate raw database chunks and concatenates them into single XML document.
-        Drops malformed chunks silently to protect prompt intergrity.
+        Drops malformed chunks silently to protect prompt integrity.
         """
 
         if not raw_chunks:
             logger.warning("No chunks provided to the context manager. Returning empty context.")
-            return "<codebase_context>\n<codebase_context>"
+            return "<codebase_context>\n</codebase_context>"
 
         valid_xml_blocks = []
 
@@ -33,7 +33,7 @@ class ContextManager:
 
             except ValidationError as e:
                 logger.warning(f"Dropped malformed chunk from context. Error: {e}")
-                return "<codebase_context>\n</codebase_context>"
+                continue
 
         if not valid_xml_blocks:
             logger.error("All retrieved chunks were malformed. Context is empty")
