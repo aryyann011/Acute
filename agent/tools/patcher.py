@@ -1,6 +1,7 @@
 import shutil
 import textwrap
 import ast
+import difflib
 from pathlib import Path
 import subprocess
 from loguru import logger
@@ -76,10 +77,18 @@ class CodePatcher:
                 shifted_lines.append(f"{base_prefix}{line}")   # dedent already carries the correct RELATIVE indent
         return "".join(shifted_lines)
 
-    def patch_file(self, file_path: str, target_function: str, new_code: str, create_backup: bool = True) -> bool:
+    def patch_file(
+        self,
+        file_path: str,
+        target_function: str,
+        new_code: str,
+        create_backup: bool = True,
+        dry_run: bool = False,
+    ) -> bool:
         """
         Executes the targeted AST byte-splice.
         create_backup=False is used inside transactions that snapshot files separately.
+        dry_run=True runs the exact same gates but PRINTS a unified diff instead of writing.
         """
         path = Path(file_path)
 
@@ -148,6 +157,21 @@ class CodePatcher:
                 f"break the file's syntax (line {e.lineno}: {e.msg}). No changes written."
             )
             return False
+
+        if dry_run:
+            original_text = file_bytes.decode("utf-8", errors="replace")
+            candidate_text = candidate_bytes.decode("utf-8", errors="replace")
+            diff = "\n".join(
+                difflib.unified_diff(
+                    original_text.splitlines(keepends=True),
+                    candidate_text.splitlines(keepends=True),
+                    fromfile=f"{path} (before)",
+                    tofile=f"{path} (after)",
+                )
+            )
+            print("\n" + diff + "\n")
+            logger.success(f"DRY-RUN ok: '{target_function}' in {path} would be patched cleanly.")
+            return True
 
         with open(path, "wb") as f:
             f.write(candidate_bytes)

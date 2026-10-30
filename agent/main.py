@@ -63,7 +63,7 @@ def index(path: str = "."):
     logger.success(f"Phase 2 Complete. {len(embedded_chunks)} chunks securely persisted to disk.")
 
 @app.command()
-def fix(bug: str):
+def fix(bug: str, dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Show what WOULD change (unified diff) without writing any file.")):
     """
     Run the autonomous agent loop to fix a bug report.
     """
@@ -98,6 +98,21 @@ def fix(bug: str):
 
     patcher = CodePatcher()
     total = len(patch.edits)
+
+    if dry_run:
+        logger.info(f"DRY-RUN: showing what WOULD change for {total} edit(s). Nothing will be written.")
+        for index, edit in enumerate(patch.edits, start=1):
+            logger.info(f"Previewing edit {index}/{total} -> {edit.filepath} :: {edit.target_function}")
+            ok = patcher.patch_file(
+                edit.filepath, edit.target_function, edit.fixed_code,
+                create_backup=False, dry_run=True,
+            )
+            if not ok:
+                logger.error(f"Preview {index} did NOT apply cleanly — this edit would be rejected.")
+                raise typer.Exit(code=1)
+        logger.success("DRY-RUN complete. No files were modified.")
+        return
+
     logger.info(f"Generated {total} edit(s). Beginning transactional patch application.")
 
     # Decision 2 - all-or-nothing: snapshot every target file ONCE, before any edit runs.
