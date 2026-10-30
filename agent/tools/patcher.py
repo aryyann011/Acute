@@ -1,4 +1,6 @@
 import shutil
+import textwrap
+import ast
 from pathlib import Path
 import subprocess
 from loguru import logger
@@ -37,6 +39,42 @@ class CodePatcher:
         except OSError as e:
             logger.error(f"Rollback failed for {file_path}: {e}")
             return False
+
+    def _line_prefix_at(self, file_bytes: bytes, byte_index: int) -> str:
+        """
+        Returns the whitespace (indentation) written in the file on the line containing
+        byte_index, up to byte_index. This is the indentation the REAL file already owns.
+        """
+        step = byte_index - 1
+        prefix = []
+        while step >= 0 and file_bytes[step] in (0x20, 0x09):  # space or tab
+            prefix.append(chr(file_bytes[step]))
+            step -= 1
+        return "".join(reversed(prefix))
+
+    def _normalize_incoming_code(self, new_code: str, base_prefix: str) -> str:
+        """
+        Gate step 1-3: strip Gemini's uniform leading indent, prove the result is valid
+        Python, then shift interior lines by the indentation the file itself uses.
+        Raises ValueError when the incoming code is not valid Python (gate step 2).
+        """
+        dedented = textwrap.dedent(new_code)
+
+        try:
+            ast.parse(dedented)
+        except SyntaxError as e:
+            raise ValueError(f"Generated code is not valid Python: line {e.lineno}: {e.msg}")
+
+        if not base_prefix:
+            return dedented
+
+        shifted_lines = []
+        for position, line in enumerate(dedented.splitlines(keepends=True)):
+            if position == 0 or not line.strip():   # first line meets the file's existing indent; blanks stay blank
+                shifted_lines.append(line)
+            else:
+                shifted_lines.append(f"{base_prefix}{line}")   # dedent already carries the correct RELATIVE indent
+        return "".join(shifted_lines)
 
     def patch_file(self, file_path: str, target_function: str, new_code: str, create_backup: bool = True) -> bool:
         """
@@ -87,15 +125,32 @@ class CodePatcher:
 
         start_byte = target_node.start_byte
         end_byte = target_node.end_byte
-        
+
         logger.debug(f"Target '{target_function}' found. Slicing from byte {start_byte} to {end_byte}.")
 
-        new_code_bytes = new_code.encode("utf-8")
+        # Gate 1-3: strip incoming indent, validate it as Python, re-indent to the file's convention
+        base_prefix = self._line_prefix_at(file_bytes, start_byte)
+        try:
+            normalized_code = self._normalize_incoming_code(new_code, base_prefix)
+        except ValueError as e:
+            logger.error(f"Patch rejected before write ({path}): {e}")
+            return False
+        normalized_bytes = normalized_code.encode("utf-8")
 
-        patched_bytes = file_bytes[:start_byte] + new_code_bytes + file_bytes[end_byte:]
+        candidate_bytes = file_bytes[:start_byte] + normalized_bytes + file_bytes[end_byte:]
+
+        # Gate 4: prove the ENTIRE spliced file still parses before anything touches the disk
+        try:
+            ast.parse(candidate_bytes.decode("utf-8", errors="replace"))
+        except SyntaxError as e:
+            logger.error(
+                f"Patch rejected before write ({path}): splicing '{target_function}' would "
+                f"break the file's syntax (line {e.lineno}: {e.msg}). No changes written."
+            )
+            return False
 
         with open(path, "wb") as f:
-            f.write(patched_bytes)
+            f.write(candidate_bytes)
             
         logger.success(f"Successfully patched '{target_function}' in {path}")
 
