@@ -17,17 +17,39 @@ class CodePatcher:
         logger.info(f"Safety First: Created backup at {backup_path}")
         return backup_path
 
-    def patch_file(self, file_path: str, target_function: str, new_code: str) -> bool:
+    def snapshot_file(self, file_path: str) -> Path | None:
         """
-        Executes the targeted AST byte-splice.
+        Transaction snapshot: copies the file to a .bak ONCE, before any edits in the
+        batch touch it. Returns None if the file does not exist.
         """
         path = Path(file_path)
-        
+        if not path.exists():
+            logger.error(f"Cannot snapshot, file not found: {path}")
+            return None
+        return self._backup_file(path)
+
+    def restore_file(self, file_path: str, backup_path: Path) -> bool:
+        """Rollback: copies the snapshot back over the (possibly modified) original."""
+        try:
+            shutil.copy2(backup_path, Path(file_path))
+            logger.info(f"Restored {file_path} from {backup_path}")
+            return True
+        except OSError as e:
+            logger.error(f"Rollback failed for {file_path}: {e}")
+            return False
+
+    def patch_file(self, file_path: str, target_function: str, new_code: str, create_backup: bool = True) -> bool:
+        """
+        Executes the targeted AST byte-splice.
+        create_backup=False is used inside transactions that snapshot files separately.
+        """
+        path = Path(file_path)
+
         if not path.exists():
             logger.error(f"File not found: {path}")
             return False
 
-        backup_path = self._backup_file(path)
+        backup_path = self._backup_file(path) if create_backup else None
         with open(path, "rb") as f:
             file_bytes = f.read()
 
@@ -76,6 +98,9 @@ class CodePatcher:
             f.write(patched_bytes)
             
         logger.success(f"Successfully patched '{target_function}' in {path}")
+
+        if backup_path is None:
+            return True
 
         try:
             logger.info("Launching VS Code diff viewer...")
