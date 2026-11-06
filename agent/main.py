@@ -10,6 +10,7 @@ from agent.tools.coder import Coder
 from agent.tools.patcher import CodePatcher
 from agent.tools.executor import TestRunner
 from agent.core.state import run_fix_loop
+from harness.recorder import record_run
 
 app = typer.Typer()
 
@@ -133,6 +134,7 @@ def fix(
         max_attempts=attempts,
         run_tests=not no_tests,
     )
+    record_run(outcome, bug, no_tests)
 
     if outcome.reason in ("tests-passed", "applied-untested", "no-tests"):
         raise typer.Exit(code=0)
