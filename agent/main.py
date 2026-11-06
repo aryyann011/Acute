@@ -8,6 +8,8 @@ from agent.rag.vector_store import QdrantDB
 from agent.core.memory import ContextManager
 from agent.tools.coder import Coder
 from agent.tools.patcher import CodePatcher
+from agent.tools.executor import TestRunner
+from agent.core.state import run_fix_loop
 
 app = typer.Typer()
 
@@ -63,7 +65,12 @@ def index(path: str = "."):
     logger.success(f"Phase 2 Complete. {len(embedded_chunks)} chunks securely persisted to disk.")
 
 @app.command()
-def fix(bug: str, dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Show what WOULD change (unified diff) without writing any file.")):
+def fix(
+    bug: str,
+    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Show what WOULD change (unified diff) without writing any file."),
+    no_tests: bool = typer.Option(False, "--no-tests", help="Skip the test run; apply the first patch and stop."),
+    attempts: int = typer.Option(3, "--attempts", min=1, max=5, help="Maximum repair attempts before giving up."),
+):
     """
     Run the autonomous agent loop to fix a bug report.
     """
@@ -113,44 +120,23 @@ def fix(bug: str, dry_run: bool = typer.Option(False, "--dry-run", "-n", help="S
         logger.success("DRY-RUN complete. No files were modified.")
         return
 
-    logger.info(f"Generated {total} edit(s). Beginning transactional patch application.")
+    logger.info(f"Generated {total} edit(s). Entering the repair loop.")
 
-    # Decision 2 - all-or-nothing: snapshot every target file ONCE, before any edit runs.
-    # (Re-snapshotting later would back up a file that earlier edits may have modified.)
-    snapshots = {}
-    for filepath in dict.fromkeys(edit.filepath for edit in patch.edits):
-        backup_path = patcher.snapshot_file(filepath)
-        if backup_path is None:
-            logger.error(f"Snapshot failed for {filepath}. Transaction aborted before any edit.")
-            raise typer.Exit(code=1)
-        snapshots[filepath] = backup_path
-
-    # Decision 1 - the CLI is the orchestrator: loop over edits and splice each one.
-    for index, edit in enumerate(patch.edits, start=1):
-        logger.info(
-            f"Applying edit {index}/{total} -> {edit.filepath} :: {edit.target_function}"
-            f" ({edit.explanation[:60]}...)"
-        )
-        ok = patcher.patch_file(
-            edit.filepath, edit.target_function, edit.fixed_code, create_backup=False
-        )
-
-        if not ok:
-            logger.error(
-                f"Edit {index} failed ('{edit.target_function}' in {edit.filepath})."
-                " Rolling back every change made in this run."
-            )
-            for filepath, backup_path in snapshots.items():
-                patcher.restore_file(filepath, backup_path)
-            logger.error("Transaction rolled back. Nothing was left half-patched.")
-            raise typer.Exit(code=1)
-
-    logger.success(
-        f"Transaction committed: {total}/{total} edit(s) applied."
-        " (.bak snapshots kept in place for manual review.)"
+    tester = None if no_tests else TestRunner(".")
+    outcome = run_fix_loop(
+        first_patch=patch,
+        bug_report=bug,
+        xml_context=context,
+        coder=coder,
+        patcher=patcher,
+        tester=tester,
+        max_attempts=attempts,
+        run_tests=not no_tests,
     )
 
-    logger.info(f"Patch generation complete for bug: '{bug}'.")
+    if outcome.reason in ("tests-passed", "applied-untested", "no-tests"):
+        raise typer.Exit(code=0)
+    raise typer.Exit(code=1)
 
 if __name__ == "__main__":
     app()

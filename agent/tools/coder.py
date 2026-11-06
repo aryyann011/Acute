@@ -5,6 +5,8 @@ from google.genai import types
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
+from agent.core.prompts import SYSTEM_PROMPT, first_attempt_prompt, retry_prompt
+
 load_dotenv()
 
 class CodePatch(BaseModel):
@@ -25,38 +27,31 @@ class Coder:
         self.client = genai.Client(api_key=api_key)
         self.model = "gemini-2.5-flash" 
         
-    def generate_patch(self, bug_report: str, xml_context: str) -> MultiFilePatch | None:
+    def generate_patch(
+        self,
+        bug_report: str,
+        xml_context: str,
+        previous_patch=None,
+        failure_output: str | None = None,
+    ) -> MultiFilePatch | None:
         """
-        Takes a bug report and a multi-file XML context document.
+        First attempt uses the plain prompt. A retry passes previous_patch +
+        failure_output so the model gets its rejected edit and the verbatim test output.
         Returns a MultiFilePatch containing a list of edits, or None if the API fails.
         """
         logger.info(f"Generating patch for bug: '{bug_report[:30]}...'")
-        
-        system_prompt = """
-        You are a senior software engineer.
-        You will be provided with a bug report and an XML document containing relevant code chunks from the repository.
-        Your job is to analyze the context, determine which files and functions need to change, and output the exact rewritten functions.
-        
-        CRITICAL RULES:
-        - Return ONLY the raw code for the new functions.
-        - Do NOT include any conversational text outside the explanation field.
-        - Keep the exact same function name and parameters unless the bug explicitly requires changing them.
-        """
-        
-        user_prompt = f"""
-        # Bug Report
-        {bug_report}
-        
-        # Codebase Context (XML)
-        {xml_context}
-        """
+
+        if previous_patch is None and failure_output is None:
+            user_prompt = first_attempt_prompt(bug_report, xml_context)
+        else:
+            user_prompt = retry_prompt(bug_report, xml_context, previous_patch, failure_output or "(no output captured)")
         
         try:
             response = self.client.models.generate_content(
                 model=self.model,
                 contents=user_prompt,
                 config=types.GenerateContentConfig(
-                    system_instruction=system_prompt,
+                    system_instruction=SYSTEM_PROMPT,
                     response_mime_type="application/json",
                     response_schema=MultiFilePatch,
                 ),
