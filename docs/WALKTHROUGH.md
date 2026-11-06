@@ -331,54 +331,76 @@ Key design points:
 - **Deferred (medium):** retry with backoff on transient 429/503 errors, and fence-stripping
   fallback if `response.parsed` is ever empty.
 
-### Step 2.5 — main-loop displays proposals
+### Step 2.5 — main-loop applies (or previews) the patch
+
+After `coder.generate_patch` returns a `MultiFilePatch`, `main.fix` now DOES one of two
+things (this is Phase 1's Decisions 1, 2, 4):
+
+- **`--dry-run`:** for each edit calls `patcher.patch_file(..., dry_run=True)` — identical
+  pipeline and gates, but prints a unified diff and writes nothing. The snapshot phase is
+  skipped entirely (nothing will change, nothing needs protecting).
+- **Real run (TRANSACTIONAL):** snapshot every unique target file *first* (one `.bak` per
+  file, taken before any edit, duplicates deduplicated via `dict.fromkeys`), then apply each
+  edit with `create_backup=False`. Any single failure → restore ALL snapshots (repo returns
+  byte-identical) → exit 1. All success → commit message + `.bak` files kept for review.
+
+Why snapshots come FIRST (the contaminated-backup trap): a batch that edits one file twice
+would, with lazy per-edit backups, overwrite the clean `.bak` with an already-patched copy —
+making rollback restore the half-patched state. Snapshots from a guaranteed-clean disk make
+the rollback trustworthy by construction.
+
+### Step 2.6 — `agent/tools/patcher.py` — the surgeon behind four gates
+
+**Role:** perform the byte-exact edit with zero collateral damage — and since Phase 1's
+Decision 3, never write code that isn't syntactically provable.
+
 ```python
-for edit in patch.edits:
-    logger.info(f"Proposed edit -> {edit.filepath} :: {edit.target_function} ...")
-```
-Deference note: applying edits automatically **is the deliberate next build step**; it is
-not wired yet (see §7).
-
-### Step 2.6 — `agent/tools/patcher.py` — the surgeon
-
-**Role:** perform the byte-exact edit with zero collateral damage. Signature (restored):
-
-```python
-def patch_file(self, file_path: str, target_function: str, new_code: str) -> bool
+def patch_file(self, file_path: str, target_function: str, new_code: str,
+               create_backup: bool = True, dry_run: bool = False) -> bool
 ```
 
-Step by step, what actually happens on disk:
+What happens, in order:
 
-1. `shutil.copy2(file_path, file_path + ".bak")` — the do-over insurance.
-2. `open(path, "rb").read()` — get the file as **raw bytes** (never as text; encodings and
-   mid-file CRLF/LF mix-ups are dodged entirely by working on bytes).
-3. `self.parser.parse(file_bytes)` — build the AST directly from bytes.
-4. Find the target node with a named S-expression query:
-   ```
-   (function_definition name: (identifier) @name
-     (#eq? @name "verify_jwt"))
-   @target_node
-   ```
-5. Extract the exact byte span: `start_byte` / `end_byte` from `QueryCursor.captures(...)`.
-6. Splice:
-   ```python
-   patched_bytes = file_bytes[:start_byte] + new_code.encode("utf-8") + file_bytes[end_byte:]
-   ```
-7. `open(path, "wb").write(patched_bytes)` — whole file rewritten with the new slice in place.
-8. Launch `code --diff <.bak> <file>` so you can eyeball the change.
+1. (Optional) `shutil.copy2` → `.bak` do-over insurance (skipped inside transactions, which
+   snapshot separately; skipped entirely in dry-run).
+2. `open(path, "rb").read()` — the file as **raw bytes** (encodings and CRLF/LF mix-ups are
+   dodged by never treating it as text).
+3. Parse the AST from bytes; find the target node by S-expression query on the function name;
+   read its exact `start_byte` / `end_byte`. (Fail → `False` = "no such function".)
+4. **Gate 1 — dedent:** `textwrap.dedent` strips Gemini's uniform leading indent (the
+   double-indent trap). Uneven input survives unchanged — it becomes Gate 2's problem.
+5. **Gate 2 — ast.parse the incoming code:** Python's official parser judges the cleaned
+   text. Logically broken indentation / bad syntax → the edit is REJECTED (never
+   auto-repaired), `False` propagates → transaction rolls everything back.
+6. **Gate 3 — re-indent from the file's own convention:** `_line_prefix_at` walks the file's
+   bytes backward from the splice point (spaces/tabs until newline) to find the indentation
+   the file already owns. First line goes in unchanged (it meets that prefix); every other
+   non-blank line gets the prefix ADDED in front of its (already-correct relative) indent.
+7. **Gate 4 — parse the entire spliced file in memory** (`ast.parse` of the full candidate
+   bytes). Fail → reject with line info; nothing was written. Only a fully-parseable file
+   proceeds → the disk write (`open(path, "wb")`).
+8. **Dry-run fork** sits just before that write: instead of writing, `difflib.unified_diff`
+   renders before/after and it returns `True`. Preview shares the write path exactly, so it
+   cannot lie.
+9. (If a `.bak` was made and not dry-run) launch `code --diff <.bak> <file>` for eyeballing.
 
-Guarantees this approach gives you:
-- **Surgical:** nothing outside `[start_byte:end_byte)` changes, not even whitespace.
-- **Self-healing input handling:** because the first byte of a function node is at the `def`
-  keyword, whatever indentation the original had at that position is *preserved by the
-  splice itself* — only lines *inside* `new_code` depend on the LLM getting indentation
-  right (that normalizer is deferred).
-- **Verified by `test_patcher.py`** on `dummy_target.py`: after patching, `do_not_touch_this`
-  must still be intact — and it is. Round-trip verified.
+Guarantees after Phase 1:
+- **Surgical:** nothing outside the replaced byte range changes.
+- **Valid code only:** all four gates pass before any write; invalid code physically cannot
+  reach the disk.
+- **Indentation-correct:** the function lands at the file's own depth (verified by the
+  suite asserting actual line depths, not just "it compiles").
+- **All-or-nothing in batches:** transaction semantics live in `main.py`; the patcher also
+  self-uses snapshot/restore via `snapshot_file` / `restore_file` (added for transactions).
+- **Permanently tested by `verify_phase1.py`** (6/6) — plus an old `test_patcher.py`
+  round-trip on `dummy_target.py`. And once end-to-end with real Gemini in a sandbox repo
+  (JWT two-dots bug fixed correctly, neighbor function untouched).
 
-- **Deferred (medium):** in-memory syntax validation of `new_code` before writing to disk,
-  indentation normalization, Python `.pyc` sanity check after patch, class-level patching,
-  `.bak` overwrite-on-second-patch semantics.
+Known quirk (documented, unfixed): if the original function had decorators, they live OUTSIDE
+the spliced byte range (preserved). If Gemini echoes the decorator inside `fixed_code`, it
+would duplicate — nobody hit it yet; decision pending. Also: `.bak` files are overwritten on
+the next patch of the same file (they represent "state right before THIS run"), and the
+patcher is Python-only today (`.py`).
 
 ---
 
@@ -387,25 +409,29 @@ Guarantees this approach gives you:
 ```
 agent/
 ├── __init__.py
-├── main.py               CLI (Typer). Commands: index, fix. Orchestrator.
+├── main.py               CLI (Typer). Commands: index, fix (--dry-run). ONLY orchestrator.
+│                         Transaction logic (snapshot-first, apply-loop, rollback) lives here.
 ├── rag/                  STAGE 1 — everything about "reading the codebase"
 │   ├── scanner.py        which files exist (git-tracked, right extension)
 │   ├── ingest.py         split them into AST-aware chunks
 │   ├── embedder.py       text -> 384-dim vectors (local, free)
-│   ├── vector_store.py   persist + search vectors (Qdrant local)
-│   └── retriever.py      (EMPTY placeholder — planned thin wrapper around QdrantDB; not used)
+│   ├── vector_store.py   persist + search vectors (Qdrant local, query_points)
+│   └── retriever.py      (EMPTY duplicate of vector_store — cleanup candidate)
 ├── core/                 the "model / orchestration" layer
 │   ├── memory.py         Pydantic validation + XML context assembly
-│   ├── prompts.py        (EMPTY placeholder — prompts will be centralized here)
+│   ├── prompts.py        (EMPTY placeholder — prompts centralized here in Phase 2)
 │   ├── planner.py        (EMPTY placeholder — future multi-step planner)
 │   ├── state.py          (EMPTY placeholder — future agent state machine)
-│   └── coder.py          (EMPTY — duplicate of tools/coder.py; decide later, keep ONE)
+│   └── coder.py          (EMPTY duplicate of tools/coder.py; keep ONE)
 ├── tools/                concrete "effectors" that touch the world
-│   ├── coder.py          Gemini client + MultiFilePatch schema
-│   ├── patcher.py        tree-sitter byte-splice surgery on real files
-│   └── executor.py       (2-line stub — will become the test-runner adapter)
+│   ├── coder.py          Gemini client + CodePatch/MultiFilePatch schemas (strict JSON)
+│   ├── patcher.py        byte-splice surgery BEHIND FOUR GATES (dedent/ast/re-indent/
+│   │                     whole-file parse) + snapshot_file/restore_file + dry-run diff
+│   └── executor.py       (2-line stub — becomes the test-runner adapter in Phase 2)
 harness/
 └── runner.py             (EMPTY placeholder — future evaluation harness)
+verify_phase1.py          6-case guarantee suite (imports ONLY the patcher; no LLM)
+test_patcher.py           legacy scratch round-trip (superseded by verify_phase1.py)
 ```
 
 **Cleanup todos (decision needed, not urgent):** `core/coder.py` vs `tools/coder.py` — keep
@@ -416,7 +442,7 @@ test-runner) starts.
 
 ## 7. Status: what works, what's deferred
 
-### Verified working (as of today)
+### Verified working (post-Phase 1)
 | Capability | Evidence |
 |---|---|
 | All 8 modules compile + import | `py_compile` + `import agent.main` pass |
@@ -426,24 +452,29 @@ test-runner) starts.
 | `ContextManager.assemble_xml_context` | produced valid `<codebase_context>` from 3 live chunks |
 | `patcher.patch_file` round-trip | `test_patcher.py` → file patched, `.bak` created, non-target function intact |
 | Embedding at query time | `embed_text` produced a 384-dim vector from raw text |
+| **Transactional application (D1+D2)** | sandbox: edit 1 applies, edit 2 fails → both files restored byte-identical |
+| **Syntax + indentation gates (D3)** | `verify_phase1.py` cases 2–4: echo lands at correct depth; broken/garbage rejected, disk untouched |
+| **`--dry-run` (D4)** | case 6: clean diff verdict, file byte-identical after |
+| **6/6 guarantee suite (D5)** | `uv run python verify_phase1.py` — all pass |
+| **Real Gemini E2E** | temp git repo: JWT bug fixed exactly right via full `fix()` flow, `.bak` created, neighbor function untouched |
 
 ### Deferred (small)
 - XML-escape `filepath`/`name` in `memory.py` (`quoteattr`)
 - Token-budget guard in context assembly
 - Drop `.ts` or add `tree-sitter-typescript` (`ingest.py` currently parses TS with the JS grammar)
-- `CodeChunk` schema mismatch check: chunk key is `name` — confirm it matches everywhere
+- Decorator-echo duplication guard in `patcher.py`
+- `.bak` timestamping (currently overwritten per run)
 
-### Deferred (medium — these are the *next* build targets, not junk to ignore)
+### Deferred (medium — next build targets, not junk to ignore)
 | # | Item | Why it matters |
 |---|---|---|
-| 1 | Wire `fix()` to actually *apply* `patch.edits` + auto-run tests | makes it a real agent, not a proposal generator |
+| 1 | Auto-run tests after patching + retry/rollback on test failure | makes it a self-healing agent (Phase 2) |
 | 2 | Sliding-window chunk info loss (`embedder.py`) | retrieval quality |
 | 3 | Collection existence check + absolute `.agent_db` path | robustness when re-running |
-| 4 | Pre-write syntax validation + indentation normalization in `patcher.py` | correctness of surgery |
-| 5 | Retry/backoff (tenacity) + JSON-fence stripping in `coder.py` | reliability against 429/503 |
-| 6 | Delta-sync (file hashing, deterministic IDs, delete-by-filepath) | speed of re-indexing |
-| 7 | Markdown-fence defense at the payload level | prompt hygiene |
-| 8 | Test-runner adapter (`executor.py`), state machine (`state.py`) | Phases 2–3 |
+| 4 | Retry/backoff (tenacity) + JSON-fence stripping in `coder.py` | reliability against 429/503 |
+| 5 | Delta-sync (file hashing, deterministic IDs, delete-by-filepath) | speed of re-indexing |
+| 6 | Markdown-fence defense at the payload level | prompt hygiene |
+| 7 | State machine (`state.py`), test-runner adapter (`executor.py`) | Phase 2 |
 
 ### Not started (0%)
 - Agentic self-healing loop (`state.py`, `executor.py`)
@@ -456,19 +487,22 @@ test-runner) starts.
 
 ```powershell
 # from repo root
-uv sync                     # install deps
-acute index                 # (re)build .agent_db from git-tracked *.py/js/ts files
-acute fix "your bug here"   # retrieve -> assemble -> LLM-judge -> show proposed edits
+uv sync                          # install deps
+acute index                      # (re)build .agent_db from git-tracked *.py/js/ts files
+acute fix "your bug here"        # retrieve -> assemble -> Gemini -> transactional patch
+acute fix "your bug here" --dry-run   # same pipeline, prints diff, writes NOTHING
+uv run python verify_phase1.py   # 6/6 guarantee suite (no LLM, seconds, temp folders)
 ```
 
 You need `GEMINI_API_KEY` in `.env` (already present, git-ignored).
 
-For the patcher-only test:
+For the legacy patcher-only check:
 ```powershell
 uv run python test_patcher.py
 ```
 It splices a known-good fake LLM response into `dummy_target.py` and verifies
-`do_not_touch_this` survives the surgery.
+`do_not_touch_this` survives the surgery. (Superseded by `verify_phase1.py`, kept for the
+raw round-trip.)
 
 ---
 

@@ -5,7 +5,8 @@
 > what the project is, why each piece exists, what happened so far, and what comes next.
 > Language is deliberately simple. Decisions are explained with examples, not jargon.
 >
-> Last updated: 2026-10-30 (Phase 1, Decisions 1+2 done)  ← I should bump this date
+> Last updated: 2026-10-31 (Phase 1 fully complete: Decisions 1–5 built + verified,
+> incl. one real Gemini end-to-end run)  ← I should bump this date
 > every time it changes, so I always know how fresh it is.
 
 ---
@@ -132,17 +133,31 @@ transaction, snapshots are taken once up front and the per-call backup is disabl
 aims at a function that doesn't exist → both files restored **byte-identical** to before
 the run, and the patched-then-restored file still compiles. That test ran green.
 
-### What Phase 1 still needs (parked decisions 3–5, pending my plain-English re-explanations)
+### The remaining three decisions, now DONE (built and verified)
 
-- **Decision 3 — indentation:** if Gemini returns a function with its own indentation
-  (or a different indent width than the file uses), splicing it raw can produce
-  double-indented or inconsistent code. The planned treatment: strip the incoming
-  indent, re-apply the file's own convention before writing. Until this lands, a bad
-  Gemini output can currently write ugly/broken code — rollback only reacts to patcher
-  errors, not to bad indentation. (This is the next thing to explain to myself properly.)
-- **Decision 4 — `--dry-run`:** show what WOULD change (git-style diff), write nothing.
-- **Decision 5 — verification pass:** assert-scripts + one real end-to-end run in a
-  sandbox repo.
+- **Decision 3 — the safety gates (syntax + indentation), landed:** before anything is
+  written to disk the incoming code is: (1) cleaned of whatever uniform indent Gemini
+  added on top, (2) parsed as Python — logically broken code is *rejected*, never
+  auto-repaired, (3) re-dented using the indentation the real file already has around the
+  function (detected from the file itself, not guessed), and (4) only after the ENTIRE
+  spliced file parses is it allowed to hit the disk. Net guarantee: invalid code
+  physically cannot be written. Verified against: an echo of the function with 8 extra
+  leading indent spaces (lands at the correct depth), a body with broken relative indent
+  (rejected, file untouched), and pure garbage (rejected, file untouched). One real bug
+  found and fixed during building: my first re-indent formula REPLACED lines' relative
+  indent with the base indent instead of adding it — caught by the gate test before it
+  could ever reach a real file.
+- **Decision 4 — `--dry-run`, landed:** `acute fix "..." --dry-run` runs the whole
+  pipeline (retrieval, Gemini, gates) but prints a git-style unified diff of what WOULD
+  change and writes nothing. Crucially it reuses the exact same code path as the real
+  write, so the preview cannot lie.
+- **Decision 5 — permanent verification, landed:** `verify_phase1.py` (run: `uv run python
+  verify_phase1.py`) — six assert-cases covering the six guarantees above (surgical patch,
+  indentation gate, broken-code rejection, garbage rejection, transaction rollback,
+  dry-run writes nothing) — 6/6 pass. Plus the milestone test: a REAL Gemini end-to-end
+  run in a throwaway git repo — the agent indexed it, understood a JWT-validation bug it
+  had never seen, patched the right function with the right logic (two-dots check), left
+  the neighboring function untouched, and the file compiled.
 
 ## 2.4 Current status at a glance
 
@@ -152,13 +167,64 @@ the run, and the patched-then-restored file still compiles. That test ran green.
 | Retrieval by bug report | ✅ working | via `query_points` |
 | Context assembly (validate + XML) | ✅ working | live-tested |
 | Gemini patch generation | ✅ working | strict JSON schema |
-| Patch application | ✅ transactional (D1+D2) | sandbox-verified |
-| Indentation safety (D3) | ❌ missing | NEXT UP |
-| `--dry-run` (D4) | ❌ missing | |
-| Self-healing loop (tests, retry, rollback on fail) | ❌ Phase 2 | empty placeholder files exist |
+| Patch application | ✅ transactional + syntax-gated | sandbox-verified + 6/6 suite |
+| Indentation / syntax gates (D3) | ✅ working | invalid code cannot reach disk |
+| `--dry-run` (D4) | ✅ working | preview = same path as write |
+| Verification suite (D5) | ✅ `verify_phase1.py` 6/6 | + real Gemini E2E green |
 | Benchmark & metrics | ❌ Phase 3 | this is where "world class" gets proven |
 | Delta re-indexing (only changed files) | ❌ Phase 4 | currently nuke-and-rebuild |
 | Deployment story (Docker/K8s/FastAPI) | ❌ Phase 5 | |
+
+---
+
+## 2.5 The code map — which file holds which logic, and who calls whom
+
+### The whole cast (every file, one line each)
+
+**The actors (files with real logic):**
+
+| File | What logic lives there |
+|---|---|
+| `agent/main.py` | the CLI + the orchestration. Two commands: `index` (scan → chunk → embed → store) and `fix` (embed bug → search → XML → Gemini → patch). The TRANSACTION (snapshot-all-first, apply loop, rollback-all-on-failure) and the `--dry-run` branch live here too. |
+| `agent/rag/scanner.py` | file discovery: asks git which files it tracks, filters to .py/.js/.ts |
+| `agent/rag/ingest.py` | chunking: tree-sitter AST → one clean dict per function/method/arrow-fn (+ imports header) |
+| `agent/rag/embedder.py` | vectorization: text → 384 floats (local bge-small); token sliding-window for giant functions; `embed_text` for bug reports |
+| `agent/rag/vector_store.py` | persistence + search: local Qdrant in `.agent_db/`, upsert points, `query_points` top-k |
+| `agent/core/memory.py` | the LLM's front-door bouncer: pydantic-validates each chunk, assembles them into the XML context document |
+| `agent/tools/coder.py` | the Gemini brain: `CodePatch`/`MultiFilePatch` schemas + the API call that forces strict JSON |
+| `agent/tools/patcher.py` | the surgeon + the safety gates: indent-prefix detection, dedent, ast-parse gate, re-indent, byte splice, whole-file parse gate, `--dry-run` rendering, snapshot/restore |
+
+**The empty seats (by design, filled in later phases):**
+`agent/core/state.py` (state machine), `agent/core/planner.py`, `agent/core/prompts.py`,
+`agent/tools/executor.py` (test runner), `harness/runner.py` (benchmark) — plus
+`agent/core/coder.py` + `agent/rag/retriever.py`, which are EMPTY duplicates and eventual cleanup targets.
+
+**Everything else:** `verify_phase1.py` (my 6-case safety suite — imports only the patcher, no LLM), `test_patcher.py` (old scratch round-trip, superseded by the suite), `pyproject.toml` (deps), `agent/__init__.py`.
+
+### The two chains (this IS the system)
+
+**Chain A — `acute index` (offline, once):**
+`main.index` calls `scanner.get_tracked_files()` → hands paths to `CodeChunker.process_files()` → hands chunk dicts to `VectorEmbedder.process_chunks()` → hands chunk-with-vector dicts to `QdrantDB.insert_chunks()`.
+
+**Chain B — `acute fix "bug"` (the live loop):**
+`main.fix` calls `VectorEmbedder().embed_text(bug)` → `QdrantDB().search()` (chunk dicts back)
+→ `ContextManager().assemble_xml_context()` (one XML string) → `Coder().generate_patch(bug, xml)`
+(a `MultiFilePatch` object) → then EITHER:
+- dry-run branch: per edit → `patcher.patch_file(..., dry_run=True)` → prints the diff, writes nothing, done; OR
+- real branch: snapshot every unique target file (`patcher.snapshot_file`) → per edit → `patcher.patch_file(..., create_backup=False)` → all succeed = committed; any failure → restore every snapshot (`patcher.restore_file`) → exit 1.
+
+**Inside `patch_file` — the four gates, in order (the heart of Phase 1):**
+1. locate the function's byte range via tree-sitter (fail = "no such function") →
+2. `_normalize_incoming_code`: dedent Gemini's uniform indent + `ast.parse` the cleaned text (fail = logically broken code) →
+3. re-indent using the prefix detected from the file's own bytes (`_line_prefix_at`) →
+4. assemble the full spliced file IN MEMORY and `ast.parse` the WHOLE file (fail = would corrupt) →
+   only then: write. A dry-run fork sits right before the write: difflib diff + zero bytes to disk.
+
+### Architecture rules I can defend out loud
+
+- `main.py` is the ONLY orchestrator; every other module is a library that knows nothing about the CLI.
+- Data shapes are the contract: chunk dicts flow through RAG; a `MultiFilePatch` crosses the LLM boundary; every patch attempt answers with a plain bool + a logged reason.
+- Constraint interlocking: the coder cannot write files; the patcher cannot run tests; the CLI cannot do surgery. A failed gate in the patcher surfaces as `False`, which the CLI's transaction converts into a byte-identical rollback.
 
 ---
 
@@ -169,7 +235,7 @@ metrics table. Most student projects have no evaluation at all; this is the diff
 
 | Phase | What | Definition of done |
 |---|---|---|
-| 1 ✅/⏳ | Close the loop | D1+D2 done; D3 (indentation), D4 (dry-run), D5 (verify) pending |
+| 1 ✅ | Close the loop | apply-loop, transactions, syntax/indent gates, dry-run, 6/6 verification — ALL DONE |
 | 2 | Agent loop | after patching, run the repo's tests; on failure revert + re-prompt Gemini with the error; cap at 3 attempts; detect no-progress; log every run to a JSONL file |
 | 3 | Benchmark | a runner that chooses a bug set (10–20 real single-file bugs from real repos, each with tests), clones, runs the agent, measures: retrieval hit@k, patch-apply rate, pass@attempts, time/cost per fix |
 | 4 | Retrieval quality | delta-sync (hash files, only re-embed changes), smarter chunking of giant functions, metadata filters, token-budgeted context |

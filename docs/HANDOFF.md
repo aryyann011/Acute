@@ -4,7 +4,8 @@
 > It records: project identity, user protocol, environment, architecture, verified state,
 > roadmap position, deferred decisions, and repo state.
 >
-> **Last updated:** 2026-10-30 — after Phase 1 Decisions 1+2 (transactional apply) landed.
+> **Last updated:** 2026-10-31 — Phase 1 COMPLETE (all 5 decisions built + verified, incl. live Gemini E2E).
+> Git: dry-run commit + verify script + doc updates NOT yet committed/pushed — user asked: no push/commit until they say so.
 > Update this file at every milestone.
 
 ---
@@ -55,8 +56,9 @@ It is the user's resume project; depth of understanding is its core deliverable.
 ## 4. Architecture map (who does what)
 
 ```
-agent/main.py               Typer CLI. Commands: index (working), fix (working end-to-end,
-                            incl. transactional patch application).
+agent/main.py               Typer CLI. Commands: index (working), fix (FULLY WORKING:
+                            transactional apply loop with --dry-run flag). ONLY orchestrator;
+                            snapshot-all-first / rollback-all logic lives here (Phase 1 D1+D2+D4).
 agent/rag/scanner.py        git ls-files -> filtered file list (.py/.js/.ts)
 agent/rag/ingest.py         CodeChunker: tree-sitter AST -> one chunk per function/method/
                             arrow-fn + file-header imports; class context prepended
@@ -71,8 +73,14 @@ agent/core/memory.py        CodeChunk (pydantic) validation firewall; ContextMan
 agent/tools/coder.py        CodePatch/MultiFilePatch schemas; Coder -> Gemini 2.5 Flash,
                             response_schema=MultiFilePatch, returns parsed model or None
 agent/tools/patcher.py      CodePatcher: snapshot_file / patch_file / restore_file;
-                            tree-sitter query finds target function node; byte splice;
-                            VS Code diff view (skipped when create_backup=False)
+                            tree-sitter query finds target function node; FOUR GATES before
+                            any write (Phase 1 D3): textwrap.dedent incoming code -> ast.parse
+                            gate -> re-indent by file's own prefix (_line_prefix_at) -> ast.parse
+                            the WHOLE spliced file in memory; dry_run branch prints difflib
+                            unified diff instead of writing; VS Code diff view (skipped when
+                            create_backup=False or dry_run)
+verify_phase1.py            6-case guarantee suite (no LLM; surgical patch, indent gate,
+                            broken/garbage rejection, transaction rollback, dry-run no-write).
 agent/core/planner.py, state.py, prompts.py   EMPTY placeholders (Phase 2 targets)
 agent/tools/executor.py     2-line stub (test runner lands here in Phase 2)
 agent/rag/retriever.py      EMPTY placeholder (unused; decide fate in cleanup)
@@ -111,18 +119,24 @@ ALL of these were actually executed and verified — not assumed:
 
 - **Phase 0 (stabilize): DONE.** All one-line fixes landed in 4 commits on branch
   `phase0-fixes` (pushed; PR not yet opened/merged as of last update).
-- **Phase 1 (close the loop): PARTIAL.** DONE: Decision 1 — apply-loop lives in `fix()`
-  (CLI orchestrates); Decision 2 — all-or-nothing transaction: snapshot every target file
-  once BEFORE any edit, abort+rollback all on any failure.
-  **NEXT (user has NOT yet approved these — explain simply first):**
-  - Decision 3: indentation normalization (dedent LLM code, re-indent to file's detected
-    unit; wrong relative-indent gets REJECTED, not repaired). Explain before fixing.
-  - Decision 4: `--dry-run` flag with difflib unified-diff preview.
-  - Decision 5: verification pass — assert-scripts + one sandbox Gemini run.
-  Note: until Decision 3 lands, patches apply raw and are NOT syntax-checked; rollback
-  only triggers on patcher failures (function not found / file missing), so a bad-indent
-  Gemini output can currently write a broken file — know this risk going into tests.
-- **Phase 2 (agent loop): NOT STARTED.** state machine (state.py), test runner adapter
+- **Phase 1 (close the loop): COMPLETE — all five decisions built and verified.**
+  DONE: Decision 1 — apply-loop lives in `fix()` (CLI orchestrates); Decision 2 —
+  all-or-nothing transaction (snapshot every target file once BEFORE any edit, abort +
+  rollback all on any failure); Decision 3 — syntax gate + indentation normalization in
+  the patcher (textwrap.dedent + ast.parse of incoming code, re-indent by the file's own
+  prefix detected from bytes before start_byte, full-file parse gate BEFORE writing —
+  invalid code physically cannot reach disk, gate returns False → transaction rolls back);
+  Decision 4 — `--dry-run` flag on fix() (same code path + gates, prints difflib unified
+  diff, writes nothing, snapshot phase skipped); Decision 5 — `verify_phase1.py` suite
+  (6 assert-cases, all green) + **real Gemini end-to-end run** in a temp git repo
+  (index -> fix -> patch applied: JWT two-dots check added, unrelated function untouched,
+  .bak created).
+  Known quirks to remember: `textwrap.dedent` removes uniform prefix only (worked for the
+  real Gemini output); Typer makes `index(path: str = ".")` an OPTION, so `acute index .`
+  errors — must run `acute index` (defaults to cwd); decorators above the target function
+  live OUTSIDE the spliced byte range (preserved, but if Gemini echoes the decorator it
+  would duplicate — not yet handled/design decision pending).
+- **Phase 2 (agent loop): NOT STARTED — next.** state machine (state.py), test runner adapter
   (executor.py: detect pytest/npm test, subprocess w/ timeout, capture stderr),
   feedback injection, max_attempts=3, no-progress detection, run JSONL artifacts.
 - **Phase 3 (benchmark): NOT STARTED.** custom 10–20 bug suite first (real repos w/ tests),
@@ -151,16 +165,13 @@ ALL of these were actually executed and verified — not assumed:
 
 ## 9. Repo / git state
 
-- Branch `phase0-fixes` current working branch. Commits on it:
-  1. `deps: add missing google-genai and python-dotenv`
-  2. `fix: repair rag modules - missing Any import, stale qdrant search api, typos`
-  3. `fix: resolve coder syntax, define MultiFilePatch, restore patcher signature, wire fix()`
-  4. `docs: add codebase walkthrough and intro readme`
-  5. (Phase 1 D1+D2: transactional patch application + handoff/summary docs)
-- `main` on GitHub is behind (884ef68); user has NOT opened/merged the PR yet.
-- Branch pattern fits their history (feature branches + PR merges).
-- `docs/WALKTHROUGH.md` exists: code-level walkthrough doc (function-by-function);
-  `docs/PROJECT_SUMMARY.md`: user-facing project narrative; this file: handoff.
+- Branch `phase1-safeguards` from synced main (e41e0b6, PRs #10/#11 already MERGED by user).
+- Pushed to origin/phase1-safeguards: `feat: syntax gate + indentation normalization before writes in patcher` (31e7148).
+- LOCAL ONLY, NOT YET COMMITTED-AND-PUSHED (needs user's go):
+  - commit exists locally: `feat: --dry-run with unified diff preview; skips transactions and writes` (c217b01)
+  - untracked: `verify_phase1.py` (6-case phase-1 assertion suite)
+  - modified: `docs/HANDOFF.md`, `docs/PROJECT_SUMMARY.md` (this + summary refresh)
+- User instruction (2026-10-31): DO NOT push or commit until they say so.
 
 ## 10. Known pitfalls / gotchas
 
