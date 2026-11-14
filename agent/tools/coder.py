@@ -1,4 +1,5 @@
 import os
+import time
 from loguru import logger
 from google import genai
 from google.genai import types
@@ -8,6 +9,8 @@ from dotenv import load_dotenv
 from agent.core.prompts import SYSTEM_PROMPT, first_attempt_prompt, retry_prompt
 
 load_dotenv()
+
+MAX_API_ATTEMPTS = 3
 
 class CodePatch(BaseModel):
     filepath: str = Field(description="The exact relative filepath of the file to modify.")
@@ -46,26 +49,31 @@ class Coder:
         else:
             user_prompt = retry_prompt(bug_report, xml_context, previous_patch, failure_output or "(no output captured)")
         
-        try:
-            response = self.client.models.generate_content(
-                model=self.model,
-                contents=user_prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_PROMPT,
-                    response_mime_type="application/json",
-                    response_schema=MultiFilePatch,
-                ),
-            )
-            
-            patch_data = response.parsed
-            
-            if not patch_data or not patch_data.edits:
-                logger.error("Gemini failed to return structured edits.")
-                return None
-                
-            logger.success(f"Successfully generated {len(patch_data.edits)} code edits via Gemini.")
-            return patch_data
-            
-        except Exception as e:
-            logger.error(f"Gemini API call failed: {e}")
-            return None
+        for api_attempt in range(1, MAX_API_ATTEMPTS + 1):
+            try:
+                response = self.client.models.generate_content(
+                    model=self.model,
+                    contents=user_prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=SYSTEM_PROMPT,
+                        response_mime_type="application/json",
+                        response_schema=MultiFilePatch,
+                    ),
+                )
+
+                patch_data = response.parsed
+
+                if not patch_data or not patch_data.edits:
+                    logger.error("Gemini failed to return structured edits.")
+                    return None
+
+                logger.success(f"Successfully generated {len(patch_data.edits)} code edits via Gemini.")
+                return patch_data
+
+            except Exception as e:
+                logger.error(f"Gemini API call failed (attempt {api_attempt}/{MAX_API_ATTEMPTS}): {e}")
+                if api_attempt == MAX_API_ATTEMPTS:
+                    return None
+                wait_seconds = 2 ** api_attempt
+                logger.warning(f"Retrying in {wait_seconds}s...")
+                time.sleep(wait_seconds)
