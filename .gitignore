@@ -13,3 +13,5 @@ logs/
 .agent_db/
 pycache/
 .env
+# run artifacts
+runs/

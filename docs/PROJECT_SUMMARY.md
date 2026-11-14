@@ -5,8 +5,8 @@
 > what the project is, why each piece exists, what happened so far, and what comes next.
 > Language is deliberately simple. Decisions are explained with examples, not jargon.
 >
-> Last updated: 2026-10-31 (Phase 1 fully complete: Decisions 1–5 built + verified,
-> incl. one real Gemini end-to-end run)  ← I should bump this date
+> Last updated: 2026-11-08 (Phase 2 fully complete: repair loop + executor + recorder
+> + API backoff, all committed and pushed; live E2Es green)  ← I should bump this date
 > every time it changes, so I always know how fresh it is.
 
 ---
@@ -159,25 +159,72 @@ the run, and the patched-then-restored file still compiles. That test ran green.
   had never seen, patched the right function with the right logic (two-dots check), left
   the neighboring function untouched, and the file compiled.
 
-## 2.4 Current status at a glance
+## 2.4 Phase 2 — the repair loop (complete, committed, pushed)
+
+**The gap it closed:** Phase 1 could apply a patch safely but never checked whether the
+patch *worked*. Phase 2 gives Acute the one ability that turns "patch generator" into
+"repair agent": run the repo's tests, and on failure, restore the repo and let Gemini try
+again — this time showing it its previous attempt and the verbatim test output.
+
+The four pieces, and why each exists:
+
+1. **`agent/tools/executor.py` (TestRunner)** — runs the repo's test suite. Detects the
+   command from the repo's own files (pytest configs → `python -m pytest -q`; npm test
+   script → npm; nothing → honest "no tests"), runs it as a subprocess with a hard 60s
+   timer, and returns a verdict that never lies: passed / failed / timed-out / didn't-run
+   are four different outcomes with different remedies. The output kept is the *tail*
+   (last ~200 lines) because that's where pytest prints the real error — and it's exactly
+   what the retry prompt needs.
+2. **`agent/core/state.py` (run_fix_loop)** — the loop brain. Per attempt: stop-gates →
+   snapshot target files → apply → run tests. Stop-gates: an identical patch returned
+   again stops before touching disk (`no-progress` — compared on code tuples, explanations
+   ignored since only code determines behavior), and two attempts failing with the same
+   first-error-line stop the loop (`stuck-on-same-error`). Every negative outcome except
+   "patch left for review" restores the repo **byte-identical** to pre-run state using
+   Phase 1's snapshot/restore — no new machinery invented.
+3. **`agent/core/prompts.py` + coder change** — the retry prompt carries three things the
+   blind "try again" never did: the previous patch with its code, the verbatim failure
+   tail, and explicit "do not return the same edit" instructions. Also landed here after
+   the move: a 3-attempt backoff (2s/4s) on transient Gemini API errors — added because a
+   real 503 ("high demand") killed a live E2E run mid-session.
+4. **`harness/recorder.py`** — every `fix()` run writes `runs/<timestamp>.json`: bug,
+   flags, end reason, per-attempt records. Phase B's benchmark will count pass rates from
+   these files, not from memory.
+
+**Verified:** 5-case loop sandbox (real patcher gates + real pytest): fail-then-fix,
+identical-patch stop with repo untouched, 3-distinct-failures exhaustion with repo
+untouched, `--no-tests`, test-less repo — plus 4-case executor sandbox, 6/6 Phase 1
+regression still green, and two live Gemini E2Es (JWT bug, median bug) both ending
+`tests-passed` with recorded artifacts. One real bug caught during building: my first
+error-line extractor grabbed pytest's source *echo* line (contains "assert") before the
+actual exception, so the stuck-gate fired one attempt too early — fixed by prioritizing
+exception lines over the assert echo.
+
+**Honest gap:** the live *retry branch* has only been exercised against a stubbed model —
+both live E2Es were one-shot fixes. Phase B's 30–50 bug suite will exercise it
+statistically; no contrived failure was staged to fake coverage.
+
+## 2.5 Current status at a glance
 
 | Subsystem | Status | Notes |
 |---|---|---|
 | Index pipeline (scan → chunk → embed → store) | ✅ working | verified via logs + retrieval |
 | Retrieval by bug report | ✅ working | via `query_points` |
 | Context assembly (validate + XML) | ✅ working | live-tested |
-| Gemini patch generation | ✅ working | strict JSON schema |
+| Gemini patch generation | ✅ working | strict JSON schema + 3-attempt backoff |
 | Patch application | ✅ transactional + syntax-gated | sandbox-verified + 6/6 suite |
 | Indentation / syntax gates (D3) | ✅ working | invalid code cannot reach disk |
 | `--dry-run` (D4) | ✅ working | preview = same path as write |
 | Verification suite (D5) | ✅ `verify_phase1.py` 6/6 | + real Gemini E2E green |
-| Benchmark & metrics | ❌ Phase 3 | this is where "world class" gets proven |
-| Delta re-indexing (only changed files) | ❌ Phase 4 | currently nuke-and-rebuild |
+| Test suite execution (executor) | ✅ working | 4-case sandbox + live runs |
+| Repair loop (state machine) | ✅ working | 5-case sandbox; live E2Es one-shot so far |
+| Run artifacts (recorder) | ✅ working | `runs/*.json`, git-ignored |
+| Benchmark & metrics | ❌ Phase B (next) | this is where "world class" gets proven |
+| Agentic tool loop (model calls read/grep/edit tools) | ❌ Phase C | the big upgrade after the scoreboard |
+| Delta re-indexing (only changed files) | ❌ Phase D | currently nuke-and-rebuild |
 | Deployment story (Docker/K8s/FastAPI) | ❌ Phase 5 | |
 
----
-
-## 2.5 The code map — which file holds which logic, and who calls whom
+## 2.6 The code map — which file holds which logic, and who calls whom
 
 ### The whole cast (every file, one line each)
 
@@ -185,21 +232,24 @@ the run, and the patched-then-restored file still compiles. That test ran green.
 
 | File | What logic lives there |
 |---|---|
-| `agent/main.py` | the CLI + the orchestration. Two commands: `index` (scan → chunk → embed → store) and `fix` (embed bug → search → XML → Gemini → patch). The TRANSACTION (snapshot-all-first, apply loop, rollback-all-on-failure) and the `--dry-run` branch live here too. |
+| `agent/main.py` | the CLI + front half of the flow. Commands: `index` and `fix` (`--dry-run` / `--attempts N` / `--no-tests`). Owns: embed bug → search → XML → first Gemini call → dry-run branch; the real run is delegated to `state.run_fix_loop`, exit code mapped from its verdict. |
+| `agent/core/state.py` | the repair loop: stop-gates (no-progress, stuck-echo), lazy snapshots, sequential apply, test verdict branching, `RunOutcome`/`AttemptRecord`. |
+| `agent/core/prompts.py` | both Gemini message bodies: first-attempt and informed-retry templates + system prompt. |
+| `agent/tools/executor.py` | `TestRunner`: command detection (pytest/npm), subprocess with 60s timer, honest 4-way verdict with output tail. |
+| `harness/recorder.py` | per-run JSON artifact writer (`runs/`, git-ignored), never raises. |
 | `agent/rag/scanner.py` | file discovery: asks git which files it tracks, filters to .py/.js/.ts |
 | `agent/rag/ingest.py` | chunking: tree-sitter AST → one clean dict per function/method/arrow-fn (+ imports header) |
 | `agent/rag/embedder.py` | vectorization: text → 384 floats (local bge-small); token sliding-window for giant functions; `embed_text` for bug reports |
 | `agent/rag/vector_store.py` | persistence + search: local Qdrant in `.agent_db/`, upsert points, `query_points` top-k |
 | `agent/core/memory.py` | the LLM's front-door bouncer: pydantic-validates each chunk, assembles them into the XML context document |
-| `agent/tools/coder.py` | the Gemini brain: `CodePatch`/`MultiFilePatch` schemas + the API call that forces strict JSON |
+| `agent/tools/coder.py` | the Gemini brain: schemas + prompts.py wiring + retry/backoff around the API call |
 | `agent/tools/patcher.py` | the surgeon + the safety gates: indent-prefix detection, dedent, ast-parse gate, re-indent, byte splice, whole-file parse gate, `--dry-run` rendering, snapshot/restore |
 
 **The empty seats (by design, filled in later phases):**
-`agent/core/state.py` (state machine), `agent/core/planner.py`, `agent/core/prompts.py`,
-`agent/tools/executor.py` (test runner), `harness/runner.py` (benchmark) — plus
+`agent/core/planner.py`, `harness/runner.py` (benchmark driver) — plus
 `agent/core/coder.py` + `agent/rag/retriever.py`, which are EMPTY duplicates and eventual cleanup targets.
 
-**Everything else:** `verify_phase1.py` (my 6-case safety suite — imports only the patcher, no LLM), `test_patcher.py` (old scratch round-trip, superseded by the suite), `pyproject.toml` (deps), `agent/__init__.py`.
+**Everything else:** `verify_phase1.py` (my 6-case safety suite — imports only the patcher, no LLM), `test_patcher.py` (old scratch round-trip, superseded by the suite), `pyproject.toml` (deps incl. pytest as a dev dep), `agent/__init__.py`.
 
 ### The two chains (this IS the system)
 
@@ -211,7 +261,12 @@ the run, and the patched-then-restored file still compiles. That test ran green.
 → `ContextManager().assemble_xml_context()` (one XML string) → `Coder().generate_patch(bug, xml)`
 (a `MultiFilePatch` object) → then EITHER:
 - dry-run branch: per edit → `patcher.patch_file(..., dry_run=True)` → prints the diff, writes nothing, done; OR
-- real branch: snapshot every unique target file (`patcher.snapshot_file`) → per edit → `patcher.patch_file(..., create_backup=False)` → all succeed = committed; any failure → restore every snapshot (`patcher.restore_file`) → exit 1.
+- real branch: `state.run_fix_loop(first_patch, bug, xml, coder, patcher, TestRunner("."))` —
+  per attempt: stop-gates → snapshot targets (`patcher.snapshot_file`) → apply edits
+  (`patcher.patch_file(..., create_backup=False)`) → `executor.TestRunner.run()` →
+  pass = done / fail = restore all snapshots + re-generate with previous patch and
+  verbatim failure tail / no-tests = leave patch for review. Outcome lands as a
+  `RunOutcome`, printed reasons mapped to exit codes, recorded by `harness.recorder`.
 
 **Inside `patch_file` — the four gates, in order (the heart of Phase 1):**
 1. locate the function's byte range via tree-sitter (fail = "no such function") →
@@ -236,10 +291,11 @@ metrics table. Most student projects have no evaluation at all; this is the diff
 | Phase | What | Definition of done |
 |---|---|---|
 | 1 ✅ | Close the loop | apply-loop, transactions, syntax/indent gates, dry-run, 6/6 verification — ALL DONE |
-| 2 | Agent loop | after patching, run the repo's tests; on failure revert + re-prompt Gemini with the error; cap at 3 attempts; detect no-progress; log every run to a JSONL file |
-| 3 | Benchmark | a runner that chooses a bug set (10–20 real single-file bugs from real repos, each with tests), clones, runs the agent, measures: retrieval hit@k, patch-apply rate, pass@attempts, time/cost per fix |
-| 4 | Retrieval quality | delta-sync (hash files, only re-embed changes), smarter chunking of giant functions, metadata filters, token-budgeted context |
-| 5 | Production story | Dockerfile, FastAPI endpoint serving `fix`, Qdrant as a server container, deploy on a local K8s (kind) — because there's a cloud-native story to tell if the agent core is solid |
+| 2 ✅ | Repair loop | run the repo's tests; on failure revert + re-prompt Gemini with previous patch + verbatim error; `--attempts` cap; no-progress + stuck-echo stop-gates; per-run JSON artifacts — ALL DONE |
+| 3 → B | Benchmark (scoreboard) | seeded bug suite (30–50 test-anchored bugs), runner over `acute fix`, metrics from `runs/*.json`: pass rate, pass@attempts, cost per fix, published README table |
+| 4 → C | Agentic tool loop | model calls read/grep/apply-edit/run-tests tools turn-by-turn, bounded turns + cost caps; measured against B's baseline |
+| 5 → D | Retrieval quality | delta-sync (hash files, only re-embed changes), smarter chunking of giant functions, metadata filters, token-budgeted context — driven by C's failure patterns |
+| 6 | Production story | Dockerfile, FastAPI endpoint serving `fix`, Qdrant as a server container, deploy on a local K8s (kind) — because there's a cloud-native story to tell if the agent core is solid |
 
 Phase 3 before Phase 4 is deliberate: **measure first, then optimize what the numbers
 prove is weak.** No blind tuning.
@@ -287,7 +343,7 @@ within 3 attempts: >70%. A README table showing these numbers is the resume head
 - Giant functions are split by blind token windows today, losing line-number identity.
 - `.agent_db` lives relative to the current directory; running elsewhere misbehaves.
 - `.ts` files are parsed with the JavaScript grammar (TypeScript syntax confuses it).
-- No syntax validation before writing yet (that's Decision 3 territory).
+- The live retry branch is stub-proven only (both real E2Es were one-shot fixes) — Phase B closes this statistically.
 - `fix()` and `index` both rebuild things they should reuse (indexing is nuke-and-rebuild).
 
 ---
@@ -295,10 +351,13 @@ within 3 attempts: >70%. A README table showing these numbers is the resume head
 # PART 5 — RUN IT (cheat sheet)
 
 ```powershell
-uv sync                       # install everything
-acute index                   # build/rebuild the vector index of this repo
-acute fix "bug text here"     # retrieve → Gemini → transactional patch
-uv run python test_patcher.py # surgical round-trip check on dummy_target.py
+uv sync                              # install everything
+acute index                          # build/rebuild the vector index of this repo
+acute fix "bug text here"            # retrieve → Gemini → repair loop (tests + retry + artifacts)
+acute fix "..." --dry-run            # preview diff, writes nothing
+acute fix "..." --attempts 5         # widen retry budget (default 3, max 5)
+acute fix "..." --no-tests           # apply first patch, skip test run
+uv run python verify_phase1.py       # 6/6 safety guarantee suite
 ```
 
 - Requires `GEMINI_API_KEY` in `.env`.

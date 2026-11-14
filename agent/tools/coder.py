@@ -1,11 +1,16 @@
 import os
+import time
 from loguru import logger
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
+from agent.core.prompts import SYSTEM_PROMPT, first_attempt_prompt, retry_prompt
+
 load_dotenv()
+
+MAX_API_ATTEMPTS = 3
 
 class CodePatch(BaseModel):
     filepath: str = Field(description="The exact relative filepath of the file to modify.")
@@ -25,52 +30,50 @@ class Coder:
         self.client = genai.Client(api_key=api_key)
         self.model = "gemini-2.5-flash" 
         
-    def generate_patch(self, bug_report: str, xml_context: str) -> MultiFilePatch | None:
+    def generate_patch(
+        self,
+        bug_report: str,
+        xml_context: str,
+        previous_patch=None,
+        failure_output: str | None = None,
+    ) -> MultiFilePatch | None:
         """
-        Takes a bug report and a multi-file XML context document.
+        First attempt uses the plain prompt. A retry passes previous_patch +
+        failure_output so the model gets its rejected edit and the verbatim test output.
         Returns a MultiFilePatch containing a list of edits, or None if the API fails.
         """
         logger.info(f"Generating patch for bug: '{bug_report[:30]}...'")
+
+        if previous_patch is None and failure_output is None:
+            user_prompt = first_attempt_prompt(bug_report, xml_context)
+        else:
+            user_prompt = retry_prompt(bug_report, xml_context, previous_patch, failure_output or "(no output captured)")
         
-        system_prompt = """
-        You are a senior software engineer.
-        You will be provided with a bug report and an XML document containing relevant code chunks from the repository.
-        Your job is to analyze the context, determine which files and functions need to change, and output the exact rewritten functions.
-        
-        CRITICAL RULES:
-        - Return ONLY the raw code for the new functions.
-        - Do NOT include any conversational text outside the explanation field.
-        - Keep the exact same function name and parameters unless the bug explicitly requires changing them.
-        """
-        
-        user_prompt = f"""
-        # Bug Report
-        {bug_report}
-        
-        # Codebase Context (XML)
-        {xml_context}
-        """
-        
-        try:
-            response = self.client.models.generate_content(
-                model=self.model,
-                contents=user_prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_prompt,
-                    response_mime_type="application/json",
-                    response_schema=MultiFilePatch,
-                ),
-            )
-            
-            patch_data = response.parsed
-            
-            if not patch_data or not patch_data.edits:
-                logger.error("Gemini failed to return structured edits.")
-                return None
-                
-            logger.success(f"Successfully generated {len(patch_data.edits)} code edits via Gemini.")
-            return patch_data
-            
-        except Exception as e:
-            logger.error(f"Gemini API call failed: {e}")
-            return None
+        for api_attempt in range(1, MAX_API_ATTEMPTS + 1):
+            try:
+                response = self.client.models.generate_content(
+                    model=self.model,
+                    contents=user_prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=SYSTEM_PROMPT,
+                        response_mime_type="application/json",
+                        response_schema=MultiFilePatch,
+                    ),
+                )
+
+                patch_data = response.parsed
+
+                if not patch_data or not patch_data.edits:
+                    logger.error("Gemini failed to return structured edits.")
+                    return None
+
+                logger.success(f"Successfully generated {len(patch_data.edits)} code edits via Gemini.")
+                return patch_data
+
+            except Exception as e:
+                logger.error(f"Gemini API call failed (attempt {api_attempt}/{MAX_API_ATTEMPTS}): {e}")
+                if api_attempt == MAX_API_ATTEMPTS:
+                    return None
+                wait_seconds = 2 ** api_attempt
+                logger.warning(f"Retrying in {wait_seconds}s...")
+                time.sleep(wait_seconds)

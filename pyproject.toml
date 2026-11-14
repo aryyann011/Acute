@@ -22,3 +22,8 @@ acute = "agent.main:app"
 package = true
 [tool.setuptools]
 packages = ["agent", "harness"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
