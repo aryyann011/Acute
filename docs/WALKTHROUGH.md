@@ -16,7 +16,7 @@ plain English:
 acute fix "null pointer when token is missing in auth module"
 ```
 
-and Acute runs four stages against your repository:
+and Acute runs six stages against your repository:
 
 1. **Retrieval** — from a pre-built local database of your code, find the snippets most
    *semantically similar* to your bug description (not keyword matching — meaning matching).
@@ -24,11 +24,18 @@ and Acute runs four stages against your repository:
 3. **Generation** — send bug + context to an LLM (Gemini 2.5 Flash) and receive a *strictly
    structured JSON* patch describing exactly which function in which file must be rewritten.
 4. **Patching** — locate that function in the real file by its **byte position in the AST**,
-   cut the old bytes, splice in the new bytes, keep a `.bak` backup, show a diff.
+   cut the old bytes, splice in the new bytes (behind four validation gates).
+5. **Verification** — run the repository's own test suite (`executor.py`) and get an honest
+   verdict: passed / failed / timed out / no tests detected.
+6. **The repair loop** (`state.py`) — if tests failed, restore the repo to its exact
+   pre-run state and ask Gemini again, this time showing it *what it tried before and the
+   verbatim test failure*. Bounded attempts, stop-gates against wasted retries, and every
+   run recorded to a JSON artifact (`harness/recorder.py`).
 
 The value proposition: the LLM never sees (and never rewrites) your whole file, and could
-never hallucinate the "rest" of the file — it only rewrites one function and Acute does the
-surgery.
+never hallucinate the "rest" of the file — it only rewrites one function, Acute does the
+surgery, and the result is *proven* by tests, not assumed. A repo that cannot be fixed
+comes back byte-identical with an honest "I couldn't" verdict.
 
 ---
 
@@ -47,18 +54,23 @@ surgery.
               │  embed (384-dim vector)
               ▼
       ┌───────────────┐   top-7 chunks    ┌──────────────┐   XML   ┌──────────┐
-      │ QdrantDB      │ ────────────────▶ │ memory.py    │ ──────▶ │ Gemini   │
-      │ .search()     │                   │ (validate +  │         │ (coder)  │
+      │ QdrantDB      │ ────────────────▶ │ memory.py    │ ──────▶ │ coder.py │
+      │ .query_points │                   │ (validate +  │         │ Gemini   │
       └───────────────┘                   │  wrap XML)   │         │ JSON out │
                                           └──────────────┘         └────┬─────┘
-                                                                        │ JSON
+                                                                        │ MultiFilePatch
                                                                         ▼
-                                             ┌──────────────────────────────────┐
-                                             │ patcher.py                       │
-                                             │ parse file → find function node  │
-                                             │ → exact start_byte..end_byte     │
-                                             │ → .bak backup → splice bytes     │
-                                             └──────────────────────────────────┘
+                                   ┌─────────────────────────────────────────────┐
+                                   │ state.py  run_fix_loop()                    │
+                                   │ per attempt: snapshot targets (patcher)     │
+                                   │  → apply edits (patcher.py, 4 gates)        │
+                                   │  → executor.py runs the test suite          │
+                                   │ pass → done · fail → restore + re-prompt    │
+                                   │ with previous patch + verbatim test output  │
+                                   └───────────────────┬─────────────────────────┘
+                                                       ▼
+                                            harness/recorder.py
+                                            runs/<timestamp>.json artifact
 ```
 
 ---
@@ -306,19 +318,34 @@ class MultiFilePatch(BaseModel):
 ```
 
 ```python
-def generate_patch(self, bug_report: str, xml_context: str) -> MultiFilePatch | None:
-    system_prompt = "You are a senior software engineer... CRITICAL RULES: return only raw code..."
-    user_prompt   = f"# Bug Report\n{bug_report}\n\n# Codebase Context (XML)\n{xml_context}"
-    response = self.client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=user_prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=system_prompt,
-            response_mime_type="application/json",
-            response_schema=MultiFilePatch,   # strict structured output
-        ),
-    )
-    return response.parsed   # Pydantic model, or None on any failure
+def generate_patch(self, bug_report: str, xml_context: str,
+                   previous_patch=None, failure_output: str | None = None) -> MultiFilePatch | None:
+    # prompts.py supplies both message bodies:
+    #   first attempt  -> first_attempt_prompt(bug, xml)
+    #   retry          -> retry_prompt(bug, xml, previous_patch, failure_output)
+    #     (carries: the previous patch with its code, the verbatim test-failure tail,
+    #      and "do NOT return a functionally identical edit" instructions)
+    for api_attempt in range(1, MAX_API_ATTEMPTS + 1):   # MAX_API_ATTEMPTS = 3
+        try:
+            response = self.client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=user_prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    response_mime_type="application/json",
+                    response_schema=MultiFilePatch,   # strict structured output
+                ),
+            )
+            patch_data = response.parsed
+            if not patch_data or not patch_data.edits:
+                logger.error("Gemini failed to return structured edits.")
+                return None
+            return patch_data
+        except Exception as e:
+            logger.error(f"Gemini API call failed (attempt {api_attempt}/{MAX_API_ATTEMPTS}): {e}")
+            if api_attempt == MAX_API_ATTEMPTS:
+                return None
+            time.sleep(2 ** api_attempt)   # backoff: 2s, then 4s
 ```
 
 Key design points:
@@ -326,30 +353,92 @@ Key design points:
 - **`response_schema=MultiFilePatch`** — Gemini *must* emit JSON matching the model. This
   is why the class fields are ordered `explanation` before `fixed_code`: we are nudging the
   model to reason *before* writing code (poor-man's chain-of-thought).
+- **Prompt templates live in `agent/core/prompts.py`** (moved out of coder.py in Phase 2):
+  `SYSTEM_PROMPT`, `first_attempt_prompt`, `retry_prompt`. The retry prompt is what makes
+  attempt 2 *informed* instead of a blind coin-flip.
+- **Transient-failure backoff (landed after a real 503 killed an E2E run):** the API call
+  retries up to 3 times with 2s/4s waits; structured-empty answers return `None` without
+  retrying (they are not transient).
 - Key-from-`.env`: `GEMINI_API_KEY` loaded via `python-dotenv`.
-- On any exception → `logger.error` + `None`; the CLI exits cleanly.
-- **Deferred (medium):** retry with backoff on transient 429/503 errors, and fence-stripping
-  fallback if `response.parsed` is ever empty.
+- On final failure → `logger.error` + `None`; the CLI exits cleanly.
+- **Deferred (small):** fence-stripping fallback if `response.parsed` is ever empty.
 
-### Step 2.5 — main-loop applies (or previews) the patch
+### Step 2.5 — `agent/core/state.py` — the repair loop (`run_fix_loop`)
 
-After `coder.generate_patch` returns a `MultiFilePatch`, `main.fix` now DOES one of two
-things (this is Phase 1's Decisions 1, 2, 4):
+After `coder.generate_patch` returns a `MultiFilePatch`, `main.fix` forks:
 
-- **`--dry-run`:** for each edit calls `patcher.patch_file(..., dry_run=True)` — identical
-  pipeline and gates, but prints a unified diff and writes nothing. The snapshot phase is
-  skipped entirely (nothing will change, nothing needs protecting).
-- **Real run (TRANSACTIONAL):** snapshot every unique target file *first* (one `.bak` per
-  file, taken before any edit, duplicates deduplicated via `dict.fromkeys`), then apply each
-  edit with `create_backup=False`. Any single failure → restore ALL snapshots (repo returns
-  byte-identical) → exit 1. All success → commit message + `.bak` files kept for review.
+- **`--dry-run`:** stays in `main.py` — for each edit calls
+  `patcher.patch_file(..., dry_run=True)`: identical pipeline and gates, prints a unified
+  diff, writes nothing, no loop.
+- **Real run:** everything below happens inside `state.run_fix_loop(...)`, which owns the
+  apply/test/retry cycle. `main.py` is no longer the orchestrator of application — it
+  delegates, passes flags (`max_attempts`, `run_tests`), and maps the outcome to exit codes.
 
-Why snapshots come FIRST (the contaminated-backup trap): a batch that edits one file twice
-would, with lazy per-edit backups, overwrite the clean `.bak` with an already-patched copy —
-making rollback restore the half-patched state. Snapshots from a guaranteed-clean disk make
-the rollback trustworthy by construction.
+Per attempt, in order:
 
-### Step 2.6 — `agent/tools/patcher.py` — the surgeon behind four gates
+1. **Stop-gates first** (before any API call on attempts ≥ 2):
+   - *No-progress:* if the freshly generated patch's `(filepath, target_function,
+     fixed_code)` tuples are identical to the previous attempt's, stop (`no-progress`) —
+     the `explanation` field is excluded (Gemini rephrases reasoning every call; only code
+     determines behavior).
+   - *Stuck-echo:* if the last two attempts failed with the same first-error-line
+     (extracted with priority: exception lines containing `Error` → pytest's `FAILED`
+     summary → the `assert` echo), stop (`stuck-on-same-error`). The priority order exists
+     because pytest prints the test's *source echo* (which contains "assert") before the
+     real exception — without it, two genuinely different failures look identical.
+2. **Snapshot targets** (`patcher.snapshot_file`) — lazily, once per unique filepath,
+   before this attempt's first edit. Run-level `.bak`s taken from a clean disk are what
+   make rollback trustworthy (the contaminated-backup trap from Phase 1 applies here too).
+3. **Apply edits** — sequential `patch_file(..., create_backup=False)`; any rejection
+   (missing function / gate failure) → restore ALL snapshots → stop (`apply-rejected`).
+   Invalid code still physically cannot reach the disk.
+4. **Run the test suite** (`executor.TestRunner(".").run()`):
+   - `passed` → success, return (`tests-passed`), patch stays on disk.
+   - `ran=False` (no suite detected) → return (`no-tests`) with the patch *deliberately
+     left applied* for manual review — "no tests" must never be reported as success.
+   - `failed` → record failure tail, restore all snapshots (repo back to byte-identical
+     pre-run state), loop to attempt N+1 where Gemini receives previous patch + failure.
+5. **`--no-tests` mode:** skip step 4, apply once, return (`applied-untested`).
+
+Outcome object: `RunOutcome(fixed, reason, attempts_used, records)` — reason vocabulary:
+`tests-passed | no-tests | applied-untested | no-progress | stuck-on-same-error |
+attempts-exhausted | apply-rejected | patch-generation-failed | snapshot-failed`.
+Every attempt leaves an `AttemptRecord` (applied / test_ran / test_passed / timed_out /
+failure_output / first_error_line) — the input Phase B's benchmark will count.
+
+**Guarantee carried over from Phase 1 and still true:** every negative outcome except
+`no-tests`/`applied-untested`/`tests-passed` restores the repo **byte-identical** to its
+state at loop start.
+
+### Step 2.6 — `agent/tools/executor.py` — the honest test runner
+
+`TestRunner(repo_path)` with two methods:
+
+- `detect_test_command()` — inspects the *repo's* footprint in priority order:
+  `pytest.ini` / `setup.cfg` / `[tool.pytest` in `pyproject.toml` / a `tests/` dir with
+  `test_*.py` → `[sys.executable, "-m", "pytest", "-q"]`; `package.json` with a `"test"`
+  script → `[npm, "test"]` (resolved via `shutil.which` for Windows `npm.cmd`); anything
+  else → `None` (an honest "nothing to run", not a guess). `sys.executable` (absolute
+  interpreter path) instead of bare `pytest` avoids PATH roulette — a machine-wide
+  `pytest.exe` from the wrong env cannot hijack the run.
+- `run(timeout_seconds=60)` — subprocess with `cwd=` the repo, output captured, hard
+  timer. `TimeoutExpired` → `timed_out=True` verdict (distinct from assertion failure);
+  missing runner binary → `ran=False`. Output is trimmed to the last ~200 lines (pytest
+  prints failures at the end; this tail is what a retry prompt needs).
+
+`TestResult` dataclass: `ran / passed (exit code 0) / command / output (tail) /
+elapsed_seconds / timed_out`. Four distinct verdicts — passed, failed, timed-out,
+didn't-run — because each has a different remedy downstream.
+
+### Step 2.7 — `harness/recorder.py` — per-run evidence
+
+`record_run(outcome, bug_report, no_tests)` writes `runs/<timestamp>.json`:
+timestamp, bug, mode flags, end reason, attempts_used, and per-attempt records
+(including truncated failure tails). `runs/` is git-ignored. `record_run` never raises —
+a recording failure logs a warning and never affects the repair result. Phase B's
+benchmark counts pass rates from these files, not from recollection.
+
+### Step 2.8 — `agent/tools/patcher.py` — the surgeon behind four gates
 
 **Role:** perform the byte-exact edit with zero collateral damage — and since Phase 1's
 Decision 3, never write code that isn't syntactically provable.
@@ -409,8 +498,9 @@ patcher is Python-only today (`.py`).
 ```
 agent/
 ├── __init__.py
-├── main.py               CLI (Typer). Commands: index, fix (--dry-run). ONLY orchestrator.
-│                         Transaction logic (snapshot-first, apply-loop, rollback) lives here.
+├── main.py               CLI (Typer). Commands: index, fix (--dry-run / --attempts / --no-tests).
+│                         Owns: embed → search → XML → first Gemini call → dry-run branch.
+│                         Delegates the real run to state.run_fix_loop; maps reason → exit code.
 ├── rag/                  STAGE 1 — everything about "reading the codebase"
 │   ├── scanner.py        which files exist (git-tracked, right extension)
 │   ├── ingest.py         split them into AST-aware chunks
@@ -419,44 +509,48 @@ agent/
 │   └── retriever.py      (EMPTY duplicate of vector_store — cleanup candidate)
 ├── core/                 the "model / orchestration" layer
 │   ├── memory.py         Pydantic validation + XML context assembly
-│   ├── prompts.py        (EMPTY placeholder — prompts centralized here in Phase 2)
-│   ├── planner.py        (EMPTY placeholder — future multi-step planner)
-│   ├── state.py          (EMPTY placeholder — future agent state machine)
+│   ├── prompts.py        SYSTEM_PROMPT + first_attempt_prompt + retry_prompt (Phase 2)
+│   ├── planner.py        (EMPTY placeholder — future agentic planner, Phase C)
+│   ├── state.py          run_fix_loop: attempts, stop-gates, snapshot/restore reuse,
+│   │                     verdict mapping, AttemptRecord/RunOutcome dataclasses
 │   └── coder.py          (EMPTY duplicate of tools/coder.py; keep ONE)
 ├── tools/                concrete "effectors" that touch the world
-│   ├── coder.py          Gemini client + CodePatch/MultiFilePatch schemas (strict JSON)
-│   ├── patcher.py        byte-splice surgery BEHIND FOUR GATES (dedent/ast/re-indent/
-│   │                     whole-file parse) + snapshot_file/restore_file + dry-run diff
-│   └── executor.py       (2-line stub — becomes the test-runner adapter in Phase 2)
+│   ├── coder.py          Gemini client + schemas + prompts.py wiring + 3-attempt backoff
+│   ├── patcher.py        byte-splice surgery BEHIND FOUR GATES + snapshot/restore + dry-run diff
+│   └── executor.py       TestRunner: command detection, subprocess + 60s timer,
+│                         TestResult verdict (ran/passed/timed_out/output-tail)
 harness/
-└── runner.py             (EMPTY placeholder — future evaluation harness)
+├── recorder.py           record_run: runs/<timestamp>.json per fix() run (git-ignored)
+└── runner.py             (EMPTY placeholder — Phase B benchmark driver)
 verify_phase1.py          6-case guarantee suite (imports ONLY the patcher; no LLM)
+loop_test.py              (temp) 5-case repair-loop sandbox — see commit history for location
 test_patcher.py           legacy scratch round-trip (superseded by verify_phase1.py)
 ```
 
-**Cleanup todos (decision needed, not urgent):** `core/coder.py` vs `tools/coder.py` — keep
-one. The five `EMPTY placeholders` come alive exactly when Phase 2 (`state machine` +
-test-runner) starts.
+**Cleanup todos (decision needed, not urgent):** `core/coder.py` vs `tools/coder.py` and
+`rag/retriever.py` vs `rag/vector_store.py` — delete the empty duplicates, keep one source
+of truth.
 
 ---
 
 ## 7. Status: what works, what's deferred
 
-### Verified working (post-Phase 1)
+### Verified working (post-Phase 2)
 | Capability | Evidence |
 |---|---|
 | All 8 modules compile + import | `py_compile` + `import agent.main` pass |
-| `uv sync` clean | `google-genai 2.33`, `python-dotenv` + everything resolves |
+| `uv sync` clean | `google-genai 2.33`, `python-dotenv`, `pytest` (dev) + everything resolves |
 | `acute index` end-to-end | logs: `Successfully indexed N chunks into the database` |
 | `QdrantDB.search` via `query_points` | returns real chunks from `.agent_db` |
-| `ContextManager.assemble_xml_context` | produced valid `<codebase_context>` from 3 live chunks |
-| `patcher.patch_file` round-trip | `test_patcher.py` → file patched, `.bak` created, non-target function intact |
-| Embedding at query time | `embed_text` produced a 384-dim vector from raw text |
-| **Transactional application (D1+D2)** | sandbox: edit 1 applies, edit 2 fails → both files restored byte-identical |
+| `ContextManager.assemble_xml_context` | produced valid `<codebase_context>` from live chunks |
 | **Syntax + indentation gates (D3)** | `verify_phase1.py` cases 2–4: echo lands at correct depth; broken/garbage rejected, disk untouched |
 | **`--dry-run` (D4)** | case 6: clean diff verdict, file byte-identical after |
 | **6/6 guarantee suite (D5)** | `uv run python verify_phase1.py` — all pass |
-| **Real Gemini E2E** | temp git repo: JWT bug fixed exactly right via full `fix()` flow, `.bak` created, neighbor function untouched |
+| **TestRunner executor (Phase 2)** | 4 sandbox cases: pass, fail (tail carries the real error text), no-test-signal → `ran=False`, 30s-hanging test killed at 2s (`timed_out`) |
+| **Repair loop (Phase 2)** | 5 sandbox cases (real patcher gates + real pytest): fail-then-fix (2 attempts), identical patch → `no-progress` untouched repo, 3 distinct failures → `attempts-exhausted` untouched repo, `--no-tests` → applied-untested, test-less repo → honest `no-tests` |
+| **Run recorder (Phase 2)** | `runs/<timestamp>.json` written by live runs, schema validated |
+| **API backoff (Phase 2 close-out)** | landed after a real Gemini 503 killed an E2E run; 3 attempts, 2s/4s |
+| **Real Gemini E2E ×2** | temp git repo: JWT two-dots bug (attempt 1) + median even-length bug (attempt 1); both `tests-passed`, runs recorded. The live *retry* branch is stub-proven only (5/5 loop suite) — Phase B exercises it statistically |
 
 ### Deferred (small)
 - XML-escape `filepath`/`name` in `memory.py` (`quoteattr`)
@@ -464,21 +558,20 @@ test-runner) starts.
 - Drop `.ts` or add `tree-sitter-typescript` (`ingest.py` currently parses TS with the JS grammar)
 - Decorator-echo duplication guard in `patcher.py`
 - `.bak` timestamping (currently overwritten per run)
+- Fence-stripping fallback in `coder.py`
 
 ### Deferred (medium — next build targets, not junk to ignore)
 | # | Item | Why it matters |
 |---|---|---|
-| 1 | Auto-run tests after patching + retry/rollback on test failure | makes it a self-healing agent (Phase 2) |
-| 2 | Sliding-window chunk info loss (`embedder.py`) | retrieval quality |
-| 3 | Collection existence check + absolute `.agent_db` path | robustness when re-running |
-| 4 | Retry/backoff (tenacity) + JSON-fence stripping in `coder.py` | reliability against 429/503 |
+| 1 | Scoreboard: seed-bug suite + runner + pass-rate table | Phase B — the instrument every later decision is judged by |
+| 2 | Agentic tool loop (`read_file`/`grep`/`apply_edit` as model-called tools) | Phase C — the big upgrade |
+| 3 | Sliding-window chunk info loss (`embedder.py`) | retrieval quality (Phase D) |
+| 4 | Collection existence check + absolute `.agent_db` path | robustness when re-running |
 | 5 | Delta-sync (file hashing, deterministic IDs, delete-by-filepath) | speed of re-indexing |
-| 6 | Markdown-fence defense at the payload level | prompt hygiene |
-| 7 | State machine (`state.py`), test-runner adapter (`executor.py`) | Phase 2 |
 
 ### Not started (0%)
-- Agentic self-healing loop (`state.py`, `executor.py`)
-- Evaluation harness (`harness/runner.py`)
+- Agentic tool-calling loop (Phase C)
+- Benchmark/scoreboard (Phase B)
 - README / architecture diagram / CI
 
 ---
@@ -489,8 +582,10 @@ test-runner) starts.
 # from repo root
 uv sync                          # install deps
 acute index                      # (re)build .agent_db from git-tracked *.py/js/ts files
-acute fix "your bug here"        # retrieve -> assemble -> Gemini -> transactional patch
+acute fix "your bug here"        # retrieve -> assemble -> Gemini -> repair loop (tests + retry)
 acute fix "your bug here" --dry-run   # same pipeline, prints diff, writes NOTHING
+acute fix "..." --attempts 5     # widen the retry budget (default 3, max 5)
+acute fix "..." --no-tests       # apply the first patch and stop (no test run)
 uv run python verify_phase1.py   # 6/6 guarantee suite (no LLM, seconds, temp folders)
 ```
 
